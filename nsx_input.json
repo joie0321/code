@@ -1,0 +1,37 @@
+{
+    "nsx_manager": {
+        "url": "https://10.7.1.131",
+        "username": "admin",
+        "password": "OQwiE3(WMjFZblMFmTi(!"
+    },
+    "host_switch_profile": {
+        "id": "Uplink-Profile-SDDC-SYD-WC-01",
+        "transport_vlan": 3052,
+        "display_name": "Uplink-Profile-SDDC-SYD-WC-01"
+    },
+    "ip_pool": {
+        "display_name": "VTEP-IP-Pool-SDDC-SYD-WC-01",
+        "subnets": [
+            {
+                "allocation_ranges": [
+                    {
+                        "start": "10.7.21.66",
+                        "end": "10.7.21.94"
+                    }
+                ],
+                "gateway_ip": "10.7.21.65",
+                "cidr": "10.7.21.64/27"
+            }
+        ]
+    },
+    "transport_node_profile": {
+        "id": "Transport-Node-Profile-SDDC-SYD-WC-01",
+        "display_name": "Transport-Node-Profile-SDDC-SYD-WC-01",
+        "dvs_name": "SDDC-SYD-WC-01-DSwitch",
+        "dvs_uuid": "50 3e 1c 7f f9 02 62 a4-af ce cd fe ed 8a 34 f9"
+    },
+    "transport_node_collection": {
+        "cluster_name": "SDDC-SYD-WC-01",
+        "display_name": "Transport-Node-Collection-SDDC-SYD-WC-01"
+    }
+}

@@ -1,0 +1,57 @@
+{
+    "Subnet Information": {
+        "SDDC-SYD-WC-01-3": [
+            {
+                "VNIC ID": "ocid1.vnic.oc1.ap-sydney-1.abzxsljrtv6ll2hb5zhjtaz27qx64mrpkbbzjseaymmzkzxuefgjed66jlfa",
+                "VLAN Tag": 0,
+                "Subnet Domain FQDN": "SDDC-SYD-WC-01-3.sub08012338561.ocvssyd.oraclevcn.com"
+            }
+        ],
+        "SDDC-SYD-WC-01-1": [
+            {
+                "VNIC ID": "ocid1.vnic.oc1.ap-sydney-1.abzxsljr4fnbrkw4zysbejkv34ilcb22mra5cuxnl45qg655mddlwtr2jwja",
+                "VLAN Tag": 0,
+                "Subnet Domain FQDN": "SDDC-SYD-WC-01-1.sub08012338561.ocvssyd.oraclevcn.com"
+            }
+        ],
+        "SDDC-SYD-WC-01-2": [
+            {
+                "VNIC ID": "ocid1.vnic.oc1.ap-sydney-1.abzxsljr4nchkodtp65z7x6a4hz2aax2tz5axii7u56itpumd7lmy5fecldq",
+                "VLAN Tag": 0,
+                "Subnet Domain FQDN": "SDDC-SYD-WC-01-2.sub08012338561.ocvssyd.oraclevcn.com"
+            }
+        ]
+    },
+    "SDDC VLAN Details": [
+        {
+            "VLAN Name": "VLAN-SDDC-SYD-SDDC-SYD-UMC-vSphere",
+            "VLAN Tag": 2219,
+            "VLAN CIDR Block": "10.7.1.128/28"
+        },
+        {
+            "VLAN Name": "VLAN-SDDC-SYD-SDDC-SYD-WC-01-Provisioning Net",
+            "VLAN Tag": 1812,
+            "VLAN CIDR Block": "10.7.21.176/28"
+        },
+        {
+            "VLAN Name": "VLAN-SDDC-SYD-SDDC-SYD-WC-01-vMotion",
+            "VLAN Tag": 3710,
+            "VLAN CIDR Block": "10.7.21.96/28"
+        },
+        {
+            "VLAN Name": "VLAN-SDDC-SYD-SDDC-SYD-WC-01-Replication Net",
+            "VLAN Tag": 1119,
+            "VLAN CIDR Block": "10.7.21.160/28"
+        },
+        {
+            "VLAN Name": "VLAN-SDDC-SYD-SDDC-SYD-WC-01-vSAN",
+            "VLAN Tag": 1064,
+            "VLAN CIDR Block": "10.7.21.112/28"
+        },
+        {
+            "VLAN Name": "VLAN-SDDC-SYD-SDDC-SYD-WC-01-NSX VTEP",
+            "VLAN Tag": 3052,
+            "VLAN CIDR Block": "10.7.21.64/27"
+        }
+    ]
+}
