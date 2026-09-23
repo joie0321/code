@@ -101,12 +101,14 @@ with st.sidebar:
     st.header("Collector Appliance")
     st.caption("Local setup only. Customer credentials remain on this appliance.")
     page = st.radio(
-        "Navigation", ("Setup", "Agent Status", "IPFIX Setup"), label_visibility="collapsed"
+        "Navigation",
+        ("Collector Agent Setup", "VMware Setup", "Agent Status"),
+        label_visibility="collapsed",
     )
 
-st.title("VMware Migration Collector")
+st.title("Migration Collector Agent")
 st.caption(
-    "Register this appliance, synchronize vCenter inventory, and monitor local collection health."
+    "Register this appliance, configure technology-specific collection, and monitor local health."
 )
 
 try:
@@ -116,7 +118,7 @@ except AgentDashboardClientError as error:
     st.info("Start the local collector-agent API before opening this dashboard.")
     st.stop()
 
-if page == "Setup":
+if page == "Collector Agent Setup":
     st.subheader("1. Register or reconnect this collector")
     st.write("Create the one-time enrollment code from the OCI control-plane dashboard.")
     with st.form("registration"):
@@ -164,8 +166,13 @@ if page == "Setup":
             except AgentDashboardClientError as error:
                 st.error(str(error))
 
-    st.divider()
-    st.subheader("2. Configure vCenter locally")
+elif page == "VMware Setup":
+    st.subheader("VMware setup")
+    st.caption(
+        "Configure vCenter, synchronize VMware inventory, and manage IPFIX exporters for this "
+        "collector appliance."
+    )
+    st.subheader("1. Configure vCenter locally")
     st.caption(
         "These credentials are sent only to the loopback collector service and retained in memory."
     )
@@ -189,7 +196,7 @@ if page == "Setup":
         except AgentDashboardClientError as error:
             st.error(str(error))
 
-    st.subheader("3. Synchronize inventory")
+    st.subheader("2. Synchronize inventory")
     if st.button("Sync vCenter inventory", type="primary"):
         try:
             result = client.sync_inventory()
@@ -203,8 +210,9 @@ elif page == "Agent Status":
     st.subheader("Collector status")
     render_agent_status()
 
-else:
-    st.subheader("IPFIX setup")
+if page == "VMware Setup":
+    st.divider()
+    st.subheader("3. IPFIX setup")
     st.caption(
         "The collector listens on all appliance interfaces at UDP 4739. Select the ESXi "
         "vmk0 candidates to trust, then configure NSX/vSphere to export to this appliance IP."

@@ -100,6 +100,9 @@ and safe status. Agent Status and IPFIX counters refresh automatically every 15 
 each page also has a **Refresh now** option. It does not expose any customer credentials
 to the control plane.
 
+The control plane calculates collector health from authenticated heartbeats. A collector
+is displayed as **Offline** when no successful heartbeat is received for 180 seconds.
+
 ## IPFIX collector setup
 
 1. Register the collector and synchronize inventory from the collector dashboard.

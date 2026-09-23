@@ -39,6 +39,8 @@ from control_plane.schemas import (
     UploadResult,
 )
 
+_COLLECTOR_OFFLINE_AFTER_SECONDS = 180
+
 
 def _digest(value: str) -> str:
     return sha256(value.encode("utf-8")).hexdigest()
@@ -53,6 +55,18 @@ def _is_expired(expires_at: datetime) -> bool:
 
     normalized = expires_at.replace(tzinfo=UTC) if expires_at.tzinfo is None else expires_at
     return normalized <= _now()
+
+
+def _collector_status(last_seen_at: datetime) -> str:
+    """Derive health from the most recent authenticated agent heartbeat."""
+
+    last_seen = (
+        last_seen_at.replace(tzinfo=UTC)
+        if last_seen_at.tzinfo is None
+        else last_seen_at.astimezone(UTC)
+    )
+    cutoff = _now() - timedelta(seconds=_COLLECTOR_OFFLINE_AFTER_SECONDS)
+    return "offline" if last_seen < cutoff else "online"
 
 
 def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
@@ -374,7 +388,7 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
                 "collector_id": collector.id,
                 "tenant_id": collector.tenant_id,
                 "display_name": collector.display_name,
-                "status": collector.status,
+                "status": _collector_status(collector.last_seen_at),
                 "software_version": collector.software_version,
                 "last_seen_at": collector.last_seen_at.isoformat(),
             }
