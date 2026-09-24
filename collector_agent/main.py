@@ -64,33 +64,39 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/api/v1/collection/inventory/sync")
-    def sync_inventory() -> dict[str, object]:
+    def sync_inventory(collector_id: str) -> dict[str, object]:
         try:
-            return active_runtime.sync_inventory()
+            return active_runtime.sync_inventory(collector_id)
         except (ControlPlaneClientError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/api/v1/telemetry/observations")
-    def send_observations(payload: list[LocalObservation]) -> dict[str, object]:
+    def send_observations(collector_id: str, payload: list[LocalObservation]) -> dict[str, object]:
         try:
             observations = [item.model_dump() for item in payload]
-            return active_runtime.upload_observations(observations)
+            return active_runtime.upload_observations(collector_id, observations)
         except (ControlPlaneClientError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.get("/api/v1/ipfix/setup")
-    def ipfix_setup() -> dict[str, object]:
-        return active_runtime.ipfix_setup()
+    def ipfix_setup(collector_id: str) -> dict[str, object]:
+        try:
+            return active_runtime.ipfix_setup(collector_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/api/v1/ipfix/start")
     def start_ipfix(payload: IpfixStartRequest) -> dict[str, object]:
         try:
-            return active_runtime.start_ipfix(payload)
+            return active_runtime.start_ipfix(payload.collector_id, payload)
         except (ControlPlaneClientError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/api/v1/ipfix/stop")
-    def stop_ipfix() -> dict[str, object]:
-        return active_runtime.stop_ipfix()
+    def stop_ipfix(collector_id: str) -> dict[str, object]:
+        try:
+            return active_runtime.stop_ipfix(collector_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
 
     return app

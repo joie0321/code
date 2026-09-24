@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 
@@ -33,11 +34,15 @@ class AgentDashboardClient:
     def configure_credentials(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("/api/v1/setup/credentials", payload)
 
-    def sync_inventory(self) -> dict[str, Any]:
-        return self._request("/api/v1/collection/inventory/sync", {})
+    def sync_inventory(self, collector_id: str) -> dict[str, Any]:
+        return self._request(
+            f"/api/v1/collection/inventory/sync?{urlencode({'collector_id': collector_id})}", {}
+        )
 
-    def ipfix_setup(self) -> dict[str, Any]:
-        result = self._request("/api/v1/ipfix/setup", method="GET")
+    def ipfix_setup(self, collector_id: str) -> dict[str, Any]:
+        result = self._request(
+            f"/api/v1/ipfix/setup?{urlencode({'collector_id': collector_id})}", method="GET"
+        )
         if not isinstance(result, dict):
             raise AgentDashboardClientError("Agent returned an invalid IPFIX setup response")
         return result
@@ -45,8 +50,8 @@ class AgentDashboardClient:
     def start_ipfix(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("/api/v1/ipfix/start", payload)
 
-    def stop_ipfix(self) -> dict[str, Any]:
-        return self._request("/api/v1/ipfix/stop", {})
+    def stop_ipfix(self, collector_id: str) -> dict[str, Any]:
+        return self._request(f"/api/v1/ipfix/stop?{urlencode({'collector_id': collector_id})}", {})
 
     def _request(
         self, path: str, payload: dict[str, Any] | None = None, method: str = "POST"

@@ -377,7 +377,18 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             session.commit()
         except IntegrityError:
             session.rollback()
-            return UploadResult(accepted=0, duplicate=True)
+            existing = session.scalar(
+                select(InventoryBatch).where(
+                    InventoryBatch.collector_id == collector.id,
+                    InventoryBatch.sequence == payload.sequence,
+                )
+            )
+            if existing is not None:
+                return UploadResult(accepted=0, duplicate=True)
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Inventory snapshot contains conflicting VM identifiers.",
+            ) from None
         return UploadResult(accepted=len(payload.vms), duplicate=False)
 
     @app.get("/api/v1/dashboard/collectors", dependencies=[Depends(require_dashboard)])

@@ -7,6 +7,9 @@ from datetime import UTC, datetime, time, timedelta
 
 import streamlit as st
 
+_GRAPH_EPHEMERAL_PORT_START = 32768
+_GRAPH_EPHEMERAL_PORT_END = 65535
+
 try:  # Supports `streamlit run control_plane/dashboard.py` from the project root.
     from control_plane.config import ControlPlaneSettings
     from control_plane.dashboard_client import ControlPlaneDashboardClient, DashboardClientError
@@ -47,6 +50,32 @@ def _escape_dot(value: object) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
 
 
+def _compact_graph_label(value: object, limit: int = 18) -> str:
+    """Keep the graph scannable while leaving full values in the details table."""
+
+    label = str(value)
+    return label if len(label) <= limit else f"{label[: limit - 3]}..."
+
+
+def _compact_port_label(ports: set[str], limit: int = 2) -> str:
+    """Bound one edge label while preserving all raw ports in the detail table."""
+
+    shown = ", ".join(sorted(ports)[:limit])
+    return shown if len(ports) <= limit else f"{shown} +{len(ports) - limit}"
+
+
+def _wave_graph_dimensions(vm_count: int, zoom_percent: int) -> tuple[int, int]:
+    """Keep compact waves from being enlarged to the size of dense wave diagrams."""
+
+    base_width, base_height = (
+        (260, 220) if vm_count == 1 else (400, 260) if vm_count == 2 else (800, 480)
+    )
+    return (
+        int(base_width * zoom_percent / 100),
+        int(base_height * zoom_percent / 100),
+    )
+
+
 def _remembered_selectbox(label: str, options: dict[str, str], state_key: str) -> str:
     """Keep a selection when this page is temporarily not rendered."""
 
@@ -60,6 +89,29 @@ def _remembered_selectbox(label: str, options: dict[str, str], state_key: str) -
         st.session_state[state_key] = st.session_state[widget_key]
 
     return st.selectbox(label, options, key=widget_key, on_change=save)
+
+
+def _remembered_slider(label: str, minimum: int, maximum: int, default: int, state_key: str) -> int:
+    """Keep the graph zoom setting when the operator changes dashboard pages."""
+
+    widget_key = f"_{state_key}"
+    st.session_state.setdefault(state_key, default)
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = st.session_state[state_key]
+
+    def save() -> None:
+        st.session_state[state_key] = st.session_state[widget_key]
+
+    return st.slider(
+        label,
+        min_value=minimum,
+        max_value=maximum,
+        step=10,
+        format="%d%%",
+        key=widget_key,
+        on_change=save,
+        help="Controls the graph canvas and the size of nodes, labels, and arrows.",
+    )
 
 
 def _observation_window() -> tuple[datetime, datetime, str]:
@@ -103,6 +155,7 @@ def _wave_graph(wave: dict[str, object], connections: list[dict[str, object]]) -
     names_by_uuid = dict(zip(vm_uuids, vm_names, strict=True))
     node_ids = {vm_uuid: f"vm_{index}" for index, vm_uuid in enumerate(vm_uuids, start=1)}
     edge_ports: dict[tuple[str, str], set[str]] = {}
+    edge_dynamic_protocols: dict[tuple[str, str], set[str]] = {}
     external_ids: dict[str, str] = {}
 
     for connection in connections:
@@ -118,32 +171,50 @@ def _wave_graph(wave: dict[str, object], connections: list[dict[str, object]]) -
                 destination_ip, f"external_{len(external_ids) + 1}"
             )
         edge = (node_ids[source_uuid], destination_id)
-        edge_ports.setdefault(edge, set()).add(
-            f"{connection.get('protocol', 'tcp')}/{connection.get('destination_port', '?')}"
-        )
-        if len(edge_ports) >= 100:
+        protocol = str(connection.get("protocol", "tcp"))
+        port = connection.get("destination_port")
+        if (
+            isinstance(port, int)
+            and _GRAPH_EPHEMERAL_PORT_START <= port <= _GRAPH_EPHEMERAL_PORT_END
+        ):
+            edge_dynamic_protocols.setdefault(edge, set()).add(protocol)
+        else:
+            edge_ports.setdefault(edge, set()).add(f"{protocol}/{port}")
+        if len(set(edge_ports).union(edge_dynamic_protocols)) >= 100:
             break
 
+    graph_padding = "0.75" if len(vm_uuids) <= 2 else "0.15"
     lines = [
         "digraph migration_wave {",
         "rankdir=LR;",
-        'graph [bgcolor="transparent", pad="0.18", nodesep="0.45", ranksep="0.7"];',
+        f'graph [bgcolor="transparent", pad="{graph_padding}", nodesep="0.25", ranksep="0.55", '
+        'splines="polyline"];',
         (
-            'node [shape=box, style="rounded,filled", fontname="Arial", fontsize=10, '
-            'margin="0.12,0.06", color="#396a9f", fillcolor="#17324d", '
-            'fontcolor="#f5f8ff"];'
+            'node [shape=box, style="rounded,filled", fontname="Arial", '
+            'fontsize=10, margin="0.10,0.06", width=1.7, height=0.45, fixedsize=true, '
+            'color="#64748b", fillcolor="#dbeafe", fontcolor="#1f2937", penwidth=1.1];'
         ),
-        'edge [fontname="Arial", fontsize=8, color="#70a6d8", fontcolor="#c8dbef"];',
+        (
+            'edge [fontname="Arial", fontsize=8, color="#64748b", fontcolor="#64748b", '
+            "arrowsize=0.65, penwidth=1.0];"
+        ),
     ]
     for vm_uuid, node_id in node_ids.items():
-        lines.append(f'{node_id} [label="{_escape_dot(names_by_uuid[vm_uuid])}"];')
+        lines.append(
+            f'{node_id} [label="{_escape_dot(_compact_graph_label(names_by_uuid[vm_uuid]))}"];'
+        )
     for destination_ip, node_id in external_ids.items():
         lines.append(
-            f'{node_id} [label="External\\n{_escape_dot(destination_ip)}", '
-            'color="#a47527", fillcolor="#493719"];'
+            f'{node_id} [label="External\\n{_escape_dot(_compact_graph_label(destination_ip))}", '
+            'color="#a47527", fillcolor="#fef3c7", fontcolor="#3b2f10"];'
         )
-    for (source_id, destination_id), ports in edge_ports.items():
-        label = ", ".join(sorted(ports))
+    for edge in set(edge_ports).union(edge_dynamic_protocols):
+        source_id, destination_id = edge
+        ports = edge_ports.get(edge, set()).copy()
+        for protocol in edge_dynamic_protocols.get(edge, set()):
+            if not any(label.startswith(f"{protocol}/") for label in ports):
+                ports.add(protocol)
+        label = _compact_port_label(ports)
         lines.append(f'{source_id} -> {destination_id} [label="{_escape_dot(label)}"];')
     lines.append("}")
     return "\n".join(lines)
@@ -166,7 +237,10 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
     with refresh_control:
         st.button("Refresh now", key="refresh_migration_waves", use_container_width=True)
     options = {
-        f"{item['display_name']} - {item['tenant_id']}": item["collector_id"] for item in collectors
+        f"{item['display_name']} - {item['tenant_id']} - {item['collector_id']}": item[
+            "collector_id"
+        ]
+        for item in collectors
     }
     selected_label = _remembered_selectbox("Collector", options, "wave_collector")
     observed_after, observed_before, range_label = _observation_window()
@@ -186,6 +260,10 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
         return
 
     st.caption(f"Reporting window: {range_label}. Graphs include at most 100 unique edges.")
+    st.caption(
+        "Potential ephemeral ports (32768–65535) are hidden from graph labels; "
+        "full port values remain in the observed-connections table."
+    )
     cards = st.columns(5)
     with cards[0]:
         card("Migration waves", summary["wave_count"])
@@ -194,7 +272,7 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
     with cards[2]:
         card("Eligible powered-on VMs", summary["eligible_vm_count"])
     with cards[3]:
-        card("Waves with connections", summary["waves_with_observed_connections"])
+        card("Waves with VM-to-VM connections", summary["waves_with_observed_connections"])
     with cards[4]:
         card("VMs without connections", summary["vms_without_observed_connections"])
 
@@ -210,7 +288,18 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
     st.divider()
     st.markdown(f"#### {html.escape(selected_wave_label)}")
     st.caption(str(selected_wave["reason"]))
-    st.graphviz_chart(_wave_graph(selected_wave, connections), use_container_width=False)
+    zoom_controls, _ = st.columns((2, 5))
+    with zoom_controls:
+        diagram_zoom = _remembered_slider("Graph zoom", 60, 160, 100, "wave_graph_zoom")
+    diagram_width, diagram_height = _wave_graph_dimensions(
+        len(selected_wave["server_vm_uuids"]), diagram_zoom
+    )
+    st.graphviz_chart(
+        _wave_graph(selected_wave, connections),
+        use_container_width=False,
+        width=diagram_width,
+        height=diagram_height,
+    )
 
     wave_vm_uuids = set(selected_wave["server_vm_uuids"])
     wave_connections = [
@@ -266,6 +355,9 @@ try:
 except ValueError as error:
     st.error(f"Dashboard deployment configuration is incomplete: {error}")
     st.stop()
+
+collectors: list[dict[str, object]] = []
+
 if page == "Enroll Collector":
     st.subheader("Enroll a collector appliance")
     st.warning(
@@ -349,6 +441,7 @@ elif page == "VM Inventory":
         f"{item['display_name']} · {item['tenant_id']}": item["collector_id"] for item in collectors
     }
     selected = st.selectbox("Collector", options)
+    st.caption(f"Selected Collector ID: {options[selected]}")
     try:
         inventory = client.inventory(options[selected])
     except DashboardClientError as error:
@@ -361,7 +454,22 @@ elif page == "VM Inventory":
         card("Powered-on VMs", sum(item["power_state"] == "poweredOn" for item in inventory))
     st.divider()
     if inventory:
-        st.dataframe(inventory, use_container_width=True, hide_index=True)
+        st.dataframe(
+            [
+                {
+                    "VM name": item["vm_name"],
+                    "Hostname": item["hostname"],
+                    "IP addresses": item["ips"],
+                    "Power state": item["power_state"],
+                    "Cluster": item["cluster"],
+                    "Folder": item["folder"],
+                    "Operating system": item["os_name"],
+                }
+                for item in inventory
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
         st.info("This collector has not uploaded an inventory snapshot yet.")
 elif page == "Migration Waves":

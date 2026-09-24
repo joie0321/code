@@ -176,9 +176,11 @@ def wave_summary(
         if destination_uuid:
             connected.add(destination_uuid)
     waves = migration_waves(session, collector_id, observed_after, observed_before)
-    waves_with_connections = sum(
-        bool(set(wave["server_vm_uuids"]).intersection(connected)) for wave in waves
-    )
+    # A migration wave has a connection only when it contains an internal
+    # VM-to-VM TCP edge.  A VM may have TCP observations to an external IP,
+    # but those observations are reporting context and must not make its
+    # singleton wave appear to be an internal dependency wave.
+    waves_with_connections = sum(len(wave["server_vm_uuids"]) > 1 for wave in waves)
     return {
         "wave_count": len(waves),
         "active_inventory_vm_count": len(inventory),

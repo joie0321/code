@@ -11,11 +11,11 @@ try:  # Supports `streamlit run collector_agent/dashboard.py`.
 except ModuleNotFoundError:  # pragma: no cover - Streamlit executes this as a script.
     from dashboard_client import AgentDashboardClient, AgentDashboardClientError
 
-st.set_page_config(page_title="VMware Migration Collector", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="Migration Collector", page_icon="M", layout="wide")
 st.markdown(
     """
     <style>
-    .agent-card { min-height: 112px; padding: 1rem; border: 1px solid rgba(255,255,255,.12);
+    .agent-card { min-height: 102px; padding: 1rem; border: 1px solid rgba(255,255,255,.12);
       border-radius: 16px; background: linear-gradient(145deg, #263244, #141b27);
       box-shadow: 0 10px 24px rgba(0,0,0,.20), inset 0 1px 0 rgba(255,255,255,.08); }
     .agent-card__label { color: #B7C5D6; font-size: .78rem; font-weight: 600; }
@@ -38,63 +38,105 @@ def card(label: str, value: str) -> None:
 client = AgentDashboardClient()
 
 
+def source_options(status: dict[str, object]) -> dict[str, str]:
+    sources = status.get("sources", [])
+    if not isinstance(sources, list):
+        return {}
+    return {
+        f"{item['display_name']} — {item['collector_id']}": item["collector_id"]
+        for item in sources
+        if isinstance(item, dict)
+    }
+
+
 @st.fragment(run_every="15s")
 def render_agent_status() -> None:
-    """Refresh lightweight local agent health without contacting vCenter."""
+    """Refresh local source health without contacting vCenter."""
 
     try:
-        current_status = client.status()
+        status = client.status()
     except AgentDashboardClientError as error:
         st.warning(str(error))
         return
+    sources = status["sources"]
     st.caption("Status refreshes automatically every 15 seconds.")
     if st.button("Refresh now", key="refresh_agent_status"):
         st.rerun()
     left, middle, right = st.columns(3)
     with left:
-        card("Registration", str(current_status["registration"]).replace("_", " ").title())
+        card("Registration", str(status["registration"]).replace("_", " ").title())
     with middle:
-        card(
-            "vCenter configuration",
-            "Ready" if current_status["vcenter_configured"] else "Required",
-        )
+        card("Registered sources", str(len(sources)))
     with right:
-        card("Last inventory VM count", str(current_status["last_inventory_vm_count"]))
-    st.divider()
-    st.write(
-        "Last heartbeat:", current_status["last_heartbeat_at"] or "Waiting for first heartbeat"
-    )
-    st.write("Last inventory sync:", current_status["last_inventory_sync_at"] or "Not synchronized")
-    if current_status["last_error"]:
-        st.warning(current_status["last_error"])
+        card("IPFIX exporters", str(sum(item["ipfix_exporter_count"] for item in sources)))
+    if sources:
+        st.dataframe(
+            sources,
+            column_config={
+                "display_name": "Source",
+                "collector_id": "Collector ID",
+                "vcenter_configured": "vCenter configured",
+                "guest_credentials_configured": "Guest credentials configured",
+                "last_inventory_vm_count": "Inventory VMs",
+                "last_inventory_sync_at": "Last inventory sync",
+                "last_heartbeat_at": "Last heartbeat",
+                "ipfix_exporter_count": "IPFIX exporters",
+                "ipfix_status": "IPFIX status",
+                "ipfix_detail": "IPFIX detail",
+                "last_error": "Last error",
+            },
+            use_container_width=True,
+            hide_index=True,
+        )
     else:
-        st.success("No current collector errors.")
+        st.info("Register a collection source to begin VMware setup.")
+    rejected_datagrams = status.get("unassigned_ipfix_datagrams", [])
+    if rejected_datagrams:
+        st.warning(
+            "Unassigned IPFIX datagrams are reaching this appliance. Assign the exporter IP "
+            "to the correct source in VMware Setup."
+        )
+        st.dataframe(
+            rejected_datagrams,
+            column_config={
+                "exporter_ip": "Rejected exporter IP",
+                "datagrams_rejected": "Rejected datagrams",
+                "last_rejected_at": "Last seen",
+                "reason": "Reason",
+            },
+            column_order=("exporter_ip", "datagrams_rejected", "last_rejected_at", "reason"),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 @st.fragment(run_every="15s")
-def render_ipfix_status() -> None:
-    """Refresh local IPFIX counters without changing listener configuration."""
+def render_ipfix_status(collector_id: str) -> None:
+    """Refresh IPFIX counters that belong only to the selected source."""
 
     try:
-        current_setup = client.ipfix_setup()
+        ipfix_setup = client.ipfix_setup(collector_id)
+        listener = ipfix_setup["listener"]
     except AgentDashboardClientError as error:
         st.warning(str(error))
         return
-    listener = current_setup["listener"]
     st.caption("IPFIX counters refresh automatically every 15 seconds.")
-    if st.button("Refresh now", key="refresh_ipfix_status"):
+    if st.button("Refresh now", key=f"refresh_ipfix_status_{collector_id}"):
         st.rerun()
-    if listener["status"] == "running":
-        st.success("IPFIX listener is running.")
-    else:
-        st.info("IPFIX listener is stopped.")
-    status_columns = st.columns(4)
-    status_columns[0].metric("Datagrams accepted", listener["datagrams_received"])
-    status_columns[1].metric("Datagrams rejected", listener["datagrams_rejected"])
-    status_columns[2].metric("TCP flows found", listener["flows_received"])
-    status_columns[3].metric("Observations uploaded", listener["observations_stored"])
-    if listener["last_error"]:
-        st.warning(listener["last_error"])
+    (st.success if listener["status"] == "running" else st.info)(
+        "IPFIX listener is running."
+        if listener["status"] == "running"
+        else "IPFIX listener is stopped."
+    )
+    columns = st.columns(4)
+    columns[0].metric("Datagrams accepted", listener["datagrams_received"])
+    columns[1].metric("Selected exporters", len(listener["selected_exporters"]))
+    columns[2].metric("Flows found", listener["flows_received"])
+    columns[3].metric("Observations uploaded", listener["observations_stored"])
+    if listener["last_received_at"]:
+        st.caption(f"Last datagram for this source: {listener['last_received_at']}")
+    if ipfix_setup.get("last_error"):
+        st.warning(str(ipfix_setup["last_error"]))
 
 
 with st.sidebar:
@@ -107,26 +149,24 @@ with st.sidebar:
     )
 
 st.title("Migration Collector Agent")
-st.caption(
-    "Register this appliance, configure technology-specific collection, and monitor local health."
-)
+st.caption("Register collection sources, configure VMware collection, and monitor local health.")
 
 try:
-    client.status()
+    current_status = client.status()
 except AgentDashboardClientError as error:
     st.error(str(error))
     st.info("Start the local collector-agent API before opening this dashboard.")
     st.stop()
 
 if page == "Collector Agent Setup":
-    st.subheader("1. Register or reconnect this collector")
-    st.write("Create the one-time enrollment code from the OCI control-plane dashboard.")
+    st.subheader("Register or reconnect a collection source")
+    st.write("Create the one-time enrollment or reconnection code from the OCI control plane.")
     with st.form("registration"):
         control_plane_url = st.text_input("OCI control-plane URL", value="http://127.0.0.1:8100")
         tenant_id = st.text_input("Customer tenant ID", value="lab-customer")
         enrollment_code = st.text_input("One-time enrollment code", type="password")
-        display_name = st.text_input("Collector name", value="collector-appliance-01")
-        register = st.form_submit_button("Register collector")
+        display_name = st.text_input("Source name", value="vmware-vcenter-01")
+        register = st.form_submit_button("Register source")
     if register:
         try:
             result = client.register(
@@ -137,44 +177,50 @@ if page == "Collector Agent Setup":
                     "display_name": display_name,
                 }
             )
-            st.success(f"Collector registered: {result['status']}.")
+            st.success(f"Source registered: {result['collector_id']}.")
         except AgentDashboardClientError as error:
             st.error(str(error))
 
-    with st.expander("Reconnect an existing collector after an appliance restart"):
-        st.caption(
-            "Generate a one-time reconnection code for this collector ID from the control-plane "
-            "administrator dashboard. This rotates the agent token while preserving history."
-        )
+    with st.expander("Reconnect an existing source after an appliance restart"):
+        st.caption("Reconnection rotates the token while preserving the source history.")
         with st.form("reconnection"):
-            reconnect_control_plane_url = st.text_input(
-                "OCI control-plane URL", value="http://127.0.0.1:8100", key="reconnect_url"
-            )
+            reconnect_url = st.text_input("OCI control-plane URL", value="http://127.0.0.1:8100")
             collector_id = st.text_input("Existing collector ID")
+            reconnect_name = st.text_input("Source name (optional)")
             reconnection_code = st.text_input("One-time reconnection code", type="password")
-            reconnect = st.form_submit_button("Reconnect existing collector")
+            reconnect = st.form_submit_button("Reconnect source")
         if reconnect:
             try:
                 result = client.reconnect(
                     {
-                        "control_plane_url": reconnect_control_plane_url,
+                        "control_plane_url": reconnect_url,
                         "collector_id": collector_id,
                         "reconnection_code": reconnection_code,
+                        "display_name": reconnect_name or None,
                     }
                 )
-                st.success(f"Collector reconnected: {result['collector_id']}.")
+                st.success(f"Source reconnected: {result['collector_id']}.")
             except AgentDashboardClientError as error:
                 st.error(str(error))
+    if current_status["sources"]:
+        st.dataframe(current_status["sources"], use_container_width=True, hide_index=True)
 
 elif page == "VMware Setup":
     st.subheader("VMware setup")
-    st.caption(
-        "Configure vCenter, synchronize VMware inventory, and manage IPFIX exporters for this "
-        "collector appliance."
+    options = source_options(current_status)
+    if not options:
+        st.info("Register or reconnect a collection source before configuring VMware.")
+        st.stop()
+    selected_label = st.selectbox("Collection source", list(options))
+    selected_collector_id = options[selected_label]
+    st.caption("Credentials are retained only in memory for the selected source.")
+    selected_source = next(
+        item for item in current_status["sources"] if item["collector_id"] == selected_collector_id
     )
-    st.subheader("1. Configure vCenter locally")
-    st.caption(
-        "These credentials are sent only to the loopback collector service and retained in memory."
+    st.info(
+        "Selected source inventory in local agent: "
+        f"{selected_source['last_inventory_vm_count']} VM(s). "
+        f"Collector ID: {selected_collector_id}"
     )
     with st.form("vcenter"):
         host = st.text_input("vCenter FQDN or IP")
@@ -186,107 +232,74 @@ elif page == "VMware Setup":
         try:
             client.configure_credentials(
                 {
+                    "collector_id": selected_collector_id,
                     "vcenter_host": host,
                     "vcenter_username": username,
                     "vcenter_password": password,
                     "verify_tls": verify_tls,
                 }
             )
-            st.success("vCenter credentials are held in collector memory.")
+            st.success("vCenter credentials are held in collector memory for this source.")
         except AgentDashboardClientError as error:
             st.error(str(error))
 
-    st.subheader("2. Synchronize inventory")
+    st.subheader("Synchronize inventory")
     if st.button("Sync vCenter inventory", type="primary"):
         try:
-            result = client.sync_inventory()
+            result = client.sync_inventory(selected_collector_id)
             st.success(
-                f"Inventory synchronized: {result['discovered']} VMs uploaded to the control plane."
+                f"Inventory synchronized for Collector ID {selected_collector_id}: "
+                f"{result['discovered']} discovered, {result['accepted']} accepted "
+                "by the control plane."
             )
         except AgentDashboardClientError as error:
             st.error(str(error))
 
-elif page == "Agent Status":
-    st.subheader("Collector status")
-    render_agent_status()
-
-if page == "VMware Setup":
     st.divider()
-    st.subheader("3. IPFIX setup")
+    st.subheader("IPFIX setup")
     st.caption(
-        "The collector listens on all appliance interfaces at UDP 4739. Select the ESXi "
-        "vmk0 candidates to trust, then configure NSX/vSphere to export to this appliance IP."
+        "One appliance listener uses UDP 4739 and routes each exporter to its assigned source."
     )
     try:
-        ipfix_setup = client.ipfix_setup()
+        ipfix_setup = client.ipfix_setup(selected_collector_id)
     except AgentDashboardClientError as error:
         st.error(str(error))
         st.stop()
-
+    render_ipfix_status(selected_collector_id)
     candidates = ipfix_setup["exporter_candidates"]
-    listener = ipfix_setup["listener"]
-    render_ipfix_status()
-
+    source_ipfix_running = bool(ipfix_setup["selected_exporters"])
     if candidates:
         clusters = sorted({item["cluster"] or "Unclustered" for item in candidates})
-        selected_clusters = st.multiselect(
-            "Clusters to trust",
-            clusters,
-            default=clusters,
-            help="The default includes every discovered cluster with a vmk0 candidate.",
-        )
-        selected_candidate_hosts = [
+        selected_clusters = st.multiselect("Clusters to trust", clusters, default=clusters)
+        included = [
             item for item in candidates if (item["cluster"] or "Unclustered") in selected_clusters
         ]
-        st.caption(
-            "Each ESXi exporter is included by default. Clear an individual host to exclude all "
-            "of its displayed vmk0 candidate addresses from the listener allowlist."
-        )
         excluded_exporters: list[str] = []
-        for candidate_index, item in enumerate(selected_candidate_hosts):
-            cluster_label = item["cluster"] or "Unclustered"
-            included = st.checkbox(
-                f"Include {item['host_name']} ({cluster_label}) — {', '.join(item['vmk0_ips'])}",
+        for index, item in enumerate(included):
+            include = st.checkbox(
+                f"Include {item['host_name']} ({item['cluster'] or 'Unclustered'}) — "
+                f"{', '.join(item['vmk0_ips'])}",
                 value=True,
-                key=f"ipfix_exporter_include_{candidate_index}_{item['host_name']}",
+                key=f"ipfix_{selected_collector_id}_{index}_{item['host_name']}",
             )
-            if not included:
+            if not include:
                 excluded_exporters.extend(item["vmk0_ips"])
-        st.dataframe(
-            [
-                {
-                    "Cluster": item["cluster"] or "Unclustered",
-                    "ESXi host": item["host_name"],
-                    "vmk0 candidate address": ", ".join(item["vmk0_ips"]),
-                }
-                for item in candidates
-            ],
-            use_container_width=True,
-            hide_index=True,
-        )
     else:
-        selected_clusters = []
-        excluded_exporters = []
-        st.warning(
-            "No vmk0 candidates are available. Synchronize inventory with an account that can read "
-            "ESXi host networking, or enter the exporter IPs explicitly below."
-        )
-
-    manual_exporters = st.text_area(
-        "Additional exporter IPs (optional)",
-        help="One individual IPv4 or IPv6 address per line. Do not enter networks or ranges.",
-    )
-    if listener["status"] == "running":
-        if st.button("Stop IPFIX listener"):
+        selected_clusters, excluded_exporters = [], []
+        st.warning("No vmk0 candidates are available. Synchronize inventory or enter exporter IPs.")
+    manual_exporters = st.text_area("Additional exporter IPs (one address per line)")
+    if source_ipfix_running:
+        if st.button("Stop IPFIX for this source"):
             try:
-                client.stop_ipfix()
+                client.stop_ipfix(selected_collector_id)
                 st.rerun()
             except AgentDashboardClientError as error:
                 st.error(str(error))
-    elif st.button("Start IPFIX listener", type="primary"):
+    elif st.button("Start IPFIX for this source", type="primary"):
         try:
             client.start_ipfix(
                 {
+                    "collector_id": selected_collector_id,
                     "selected_clusters": selected_clusters,
                     "manual_exporters": manual_exporters.splitlines(),
                     "excluded_exporters": excluded_exporters,
@@ -296,3 +309,7 @@ if page == "VMware Setup":
             st.rerun()
         except AgentDashboardClientError as error:
             st.error(str(error))
+
+else:
+    st.subheader("Collector status")
+    render_agent_status()

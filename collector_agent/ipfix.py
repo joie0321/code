@@ -16,6 +16,7 @@ _TEMPLATE_SET_ID = 2
 _MIN_DATA_SET_ID = 256
 _MAX_DATAGRAM_BYTES = 65_535
 _MAX_TEMPLATE_FIELDS = 128
+_MAX_REJECTED_EXPORTERS = 20
 _SOURCE_IPV4, _DESTINATION_IPV4, _DESTINATION_PORT, _PROTOCOL = 8, 12, 11, 4
 _FLOW_END_SECONDS, _FLOW_END_MILLISECONDS = 151, 153
 
@@ -161,7 +162,7 @@ def _ipv4(value: bytes | None) -> str | None:
 class IpfixListener:
     """A single in-process UDP listener with explicit individual-IP allowlisting."""
 
-    def __init__(self, on_flows: Callable[[list[IpfixFlow]], int]) -> None:
+    def __init__(self, on_flows: Callable[[str, list[IpfixFlow]], int]) -> None:
         self._on_flows, self._lock, self._parser = on_flows, Lock(), IpfixParser()
         self._socket: socket | None = None
         self._stop_event: Event | None = None
@@ -176,6 +177,8 @@ class IpfixListener:
             "bind_host": None,
             "port": None,
             "allowed_exporters": [],
+            "exporter_stats": {},
+            "rejected_exporters": {},
             "datagrams_received": 0,
             "datagrams_rejected": 0,
             "flows_received": 0,
@@ -211,6 +214,9 @@ class IpfixListener:
                 "bind_host": bind_host,
                 "port": port,
                 "allowed_exporters": sorted(exporters),
+                "exporter_stats": {
+                    exporter: self._new_exporter_stats() for exporter in sorted(exporters)
+                },
             }
             self._thread = Thread(target=self._run, daemon=True, name="ipfix-listener")
             self._thread.start()
@@ -227,7 +233,18 @@ class IpfixListener:
 
     def status(self) -> dict[str, object]:
         with self._lock:
-            return dict(self._status)
+            return {
+                **self._status,
+                "allowed_exporters": list(self._status["allowed_exporters"]),
+                "exporter_stats": {
+                    exporter: dict(stats)
+                    for exporter, stats in dict(self._status["exporter_stats"]).items()
+                },
+                "rejected_exporters": {
+                    exporter: dict(stats)
+                    for exporter, stats in dict(self._status["rejected_exporters"]).items()
+                },
+            }
 
     def _run(self) -> None:
         while True:
@@ -243,16 +260,31 @@ class IpfixListener:
                 return
             if address[0] not in self._allowed_exporters:
                 self._increment("datagrams_rejected")
+                self._record_rejected_exporter(address[0])
                 continue
             flows = self._parser.parse(payload, address[0])
             self._increment("datagrams_received")
+            self._increment_exporter(address[0], "datagrams_received")
             self._increment("flows_received", len(flows))
+            self._increment_exporter(address[0], "flows_received", len(flows))
             self._set("last_received_at", datetime.now(UTC).isoformat())
+            self._set_exporter(address[0], "last_received_at", datetime.now(UTC).isoformat())
             if flows:
                 try:
-                    self._increment("observations_stored", self._on_flows(flows))
+                    observations_stored = self._on_flows(address[0], flows)
+                    self._increment("observations_stored", observations_stored)
+                    self._increment_exporter(address[0], "observations_stored", observations_stored)
                 except Exception:
                     self._set("last_error", "Could not upload received IPFIX flow records.")
+
+    @staticmethod
+    def _new_exporter_stats() -> dict[str, object]:
+        return {
+            "datagrams_received": 0,
+            "flows_received": 0,
+            "observations_stored": 0,
+            "last_received_at": None,
+        }
 
     def _increment(self, key: str, increment: int = 1) -> None:
         with self._lock:
@@ -261,3 +293,41 @@ class IpfixListener:
     def _set(self, key: str, value: object) -> None:
         with self._lock:
             self._status[key] = value
+
+    def _increment_exporter(self, exporter_ip: str, key: str, increment: int = 1) -> None:
+        with self._lock:
+            stats = dict(self._status["exporter_stats"]).get(exporter_ip)
+            if stats is not None:
+                stats[key] = int(stats[key]) + increment
+
+    def _set_exporter(self, exporter_ip: str, key: str, value: object) -> None:
+        with self._lock:
+            stats = dict(self._status["exporter_stats"]).get(exporter_ip)
+            if stats is not None:
+                stats[key] = value
+
+    def _record_rejected_exporter(self, exporter_ip: str) -> None:
+        """Keep a bounded, local-only diagnostic record for unassigned senders."""
+
+        observed_at = datetime.now(UTC).isoformat()
+        with self._lock:
+            rejected_exporters = self._status["rejected_exporters"]
+            if not isinstance(rejected_exporters, dict):
+                return
+            if (
+                exporter_ip not in rejected_exporters
+                and len(rejected_exporters) >= _MAX_REJECTED_EXPORTERS
+            ):
+                oldest_exporter = min(
+                    rejected_exporters,
+                    key=lambda address: str(
+                        rejected_exporters[address].get("last_rejected_at", "")
+                    ),
+                )
+                rejected_exporters.pop(oldest_exporter, None)
+            existing = rejected_exporters.get(exporter_ip, {})
+            rejected_exporters[exporter_ip] = {
+                "datagrams_rejected": int(existing.get("datagrams_rejected", 0)) + 1,
+                "last_rejected_at": observed_at,
+                "reason": "Exporter IP is not assigned to a collection source.",
+            }

@@ -16,9 +16,11 @@ class ReconnectRequest(BaseModel):
     control_plane_url: str = Field(min_length=8, max_length=2048)
     collector_id: str = Field(min_length=36, max_length=36)
     reconnection_code: SecretStr = Field(min_length=24, max_length=256)
+    display_name: str | None = Field(default=None, max_length=128, pattern=r"^[A-Za-z0-9 ._-]+$")
 
 
 class LocalCredentialsRequest(BaseModel):
+    collector_id: str = Field(min_length=36, max_length=36)
     vcenter_host: str = Field(min_length=1, max_length=255)
     vcenter_username: str = Field(min_length=1, max_length=255)
     vcenter_password: SecretStr = Field(min_length=1, max_length=1024)
@@ -38,6 +40,7 @@ class LocalObservation(BaseModel):
 
 
 class IpfixStartRequest(BaseModel):
+    collector_id: str = Field(min_length=36, max_length=36)
     selected_clusters: list[str] = Field(default_factory=list, max_length=128)
     manual_exporters: list[str] = Field(default_factory=list, max_length=128)
     excluded_exporters: list[str] = Field(default_factory=list, max_length=256)

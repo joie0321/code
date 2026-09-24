@@ -2,20 +2,40 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _project_sqlite_url(filename: str) -> str:
+    """Keep development SQLite storage independent of the launch directory."""
+
+    return f"sqlite:///{(_PROJECT_ROOT / filename).as_posix()}"
 
 
 class ControlPlaneSettings(BaseSettings):
     """Configuration loaded from environment variables, never from agent payloads."""
 
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=_PROJECT_ROOT / ".env", extra="ignore")
 
     app_env: str = "development"
-    database_url: str = "sqlite:///./control_plane.db"
+    database_url: str = _project_sqlite_url("control_plane.db")
     control_plane_admin_api_key: SecretStr
     control_plane_dashboard_api_url: str = "http://127.0.0.1:8100"
     control_plane_dashboard_api_key: SecretStr | None = None
+
+    @field_validator("database_url")
+    @classmethod
+    def resolve_project_relative_sqlite_url(cls, value: str) -> str:
+        """Avoid split SQLite databases when API and UI start from different folders."""
+
+        prefix = "sqlite:///./"
+        if value.startswith(prefix):
+            return _project_sqlite_url(value.removeprefix(prefix))
+        return value
 
     @field_validator("control_plane_admin_api_key")
     @classmethod
