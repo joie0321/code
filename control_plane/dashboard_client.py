@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 
@@ -42,6 +42,19 @@ class ControlPlaneDashboardClient:
         )
         if not isinstance(response, list):
             raise DashboardClientError("Control plane returned an invalid connection response")
+        return response
+
+    def detailed_connections(
+        self, collector_id: str, observed_after: str, observed_before: str
+    ) -> list[dict[str, Any]]:
+        response = self._get(
+            self._with_query(
+                f"/api/v1/dashboard/collectors/{collector_id}/detailed-connections",
+                {"observed_after": observed_after, "observed_before": observed_before},
+            )
+        )
+        if not isinstance(response, list):
+            raise DashboardClientError("Control plane returned an invalid detailed report response")
         return response
 
     def waves(
@@ -92,6 +105,16 @@ class ControlPlaneDashboardClient:
             raise DashboardClientError("Control plane returned an invalid reconnection response")
         return response
 
+    def delete_collector(self, collector_id: str) -> dict[str, Any]:
+        response = self._delete(
+            f"/api/v1/admin/collectors/{quote(collector_id, safe='')}", self._admin_key
+        )
+        if not isinstance(response, dict) or response.get("status") != "deleted":
+            raise DashboardClientError(
+                "Control plane returned an invalid collector deletion response"
+            )
+        return response
+
     def _get(self, path: str) -> Any:
         request = Request(
             f"{self._base_url}{path}",
@@ -106,6 +129,14 @@ class ControlPlaneDashboardClient:
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "X-Control-Plane-Key": key},
             method="POST",
+        )
+        return self._read_response(request)
+
+    def _delete(self, path: str, key: str) -> Any:
+        request = Request(
+            f"{self._base_url}{path}",
+            headers={"X-Control-Plane-Key": key},
+            method="DELETE",
         )
         return self._read_response(request)
 

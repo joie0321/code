@@ -75,7 +75,7 @@ class Observation(Base):
     destination_ip: Mapped[str] = mapped_column(String(45), index=True)
     destination_port: Mapped[int] = mapped_column(Integer)
     protocol: Mapped[str] = mapped_column(String(8))
-    collector_type: Mapped[str] = mapped_column(String(16))
+    collector_type: Mapped[str] = mapped_column(String(32))
     observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     process: Mapped[str | None] = mapped_column(Text, nullable=True)
 

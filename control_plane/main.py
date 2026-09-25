@@ -9,12 +9,12 @@ from secrets import token_urlsafe
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from control_plane.config import ControlPlaneSettings
-from control_plane.db import Base, build_engine, build_session_factory
+from control_plane.db import Base, build_engine, build_session_factory, upgrade_schema
 from control_plane.models import (
     Collector,
     Enrollment,
@@ -24,7 +24,12 @@ from control_plane.models import (
     ObservationBatch,
     ReconnectionCode,
 )
-from control_plane.reporting import connection_report, migration_waves, wave_summary
+from control_plane.reporting import (
+    connection_report,
+    detailed_connection_report,
+    migration_waves,
+    wave_summary,
+)
 from control_plane.schemas import (
     AgentHeartbeat,
     AgentReconnect,
@@ -74,11 +79,12 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
 
     configured = settings or ControlPlaneSettings()
     configured.validate_runtime()
-    engine = build_engine(configured.database_url)
+    engine = build_engine(configured.database_url_for_engine())
     Base.metadata.create_all(engine)
+    upgrade_schema(engine)
     sessions = build_session_factory(engine)
 
-    app = FastAPI(title="VMware Migration Control Plane", version="0.1.0")
+    app = FastAPI(title="Migration Discovery Control Plane", version="0.1.0")
     app.state.settings = configured
     app.state.sessions = sessions
 
@@ -204,6 +210,52 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         )
         session.commit()
         return ReconnectionCodeCreated(reconnection_code=code, expires_at=expires_at)
+
+    @app.delete("/api/v1/admin/collectors/{collector_id}")
+    def delete_collector(
+        collector_id: str,
+        _: None = Depends(require_admin),
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        """Permanently delete one collector and only its dependent telemetry."""
+
+        collector = session.get(Collector, collector_id)
+        if collector is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+        try:
+            deleted = {
+                "observations": session.execute(
+                    delete(Observation).where(Observation.collector_id == collector_id)
+                ).rowcount
+                or 0,
+                "observation_batches": session.execute(
+                    delete(ObservationBatch).where(ObservationBatch.collector_id == collector_id)
+                ).rowcount
+                or 0,
+                "inventory_vms": session.execute(
+                    delete(InventoryVm).where(InventoryVm.collector_id == collector_id)
+                ).rowcount
+                or 0,
+                "inventory_batches": session.execute(
+                    delete(InventoryBatch).where(InventoryBatch.collector_id == collector_id)
+                ).rowcount
+                or 0,
+                "reconnection_codes": session.execute(
+                    delete(ReconnectionCode).where(ReconnectionCode.collector_id == collector_id)
+                ).rowcount
+                or 0,
+            }
+            session.delete(collector)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Collector deletion could not be completed. Retry after active uploads finish."
+                ),
+            ) from None
+        return {"collector_id": collector_id, "status": "deleted", "deleted": deleted}
 
     @app.post("/api/v1/agents/reconnect", response_model=AgentRegistrationResult)
     def reconnect_agent(
@@ -453,6 +505,19 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
     ) -> list[dict[str, object]]:
         _require_collector(collector_id, session)
         return connection_report(session, collector_id, observed_after, observed_before, limit)
+
+    @app.get(
+        "/api/v1/dashboard/collectors/{collector_id}/detailed-connections",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def collector_detailed_connections(
+        collector_id: str,
+        session: Session = Depends(get_session),
+        observed_after: datetime | None = None,
+        observed_before: datetime | None = None,
+    ) -> list[dict[str, object]]:
+        _require_collector(collector_id, session)
+        return detailed_connection_report(session, collector_id, observed_after, observed_before)
 
     @app.get(
         "/api/v1/dashboard/collectors/{collector_id}/waves",

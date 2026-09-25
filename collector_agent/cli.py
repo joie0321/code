@@ -18,9 +18,7 @@ def _required_env(name: str) -> str:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="VMware Migration collector agent bootstrap client"
-    )
+    parser = argparse.ArgumentParser(description="Migration Discovery collector bootstrap client")
     parser.add_argument("command", choices=("register", "heartbeat"))
     parser.add_argument("--control-plane-url", default=environ.get("CONTROL_PLANE_URL"))
     parser.add_argument("--tenant-id", default=environ.get("COLLECTOR_TENANT_ID"))

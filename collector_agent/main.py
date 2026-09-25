@@ -10,6 +10,9 @@ from collector_agent.client import ControlPlaneClientError
 from collector_agent.config import AgentSettings
 from collector_agent.runtime import AgentRuntime
 from collector_agent.schemas import (
+    AwsCredentialsRequest,
+    AwsFlowLogSettingsRequest,
+    AzureCredentialsRequest,
     IpfixStartRequest,
     LocalCredentialsRequest,
     LocalObservation,
@@ -31,7 +34,7 @@ def create_app(
         yield
         active_runtime.shutdown()
 
-    app = FastAPI(title="VMware Migration Collector Agent", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Migration Discovery Collector", version="0.1.0", lifespan=lifespan)
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -55,6 +58,13 @@ def create_app(
         except (ControlPlaneClientError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
+    @app.delete("/api/v1/setup/sources/{collector_id}")
+    def unregister(collector_id: str) -> dict[str, str]:
+        try:
+            return active_runtime.unregister(collector_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @app.post("/api/v1/setup/credentials")
     def configure_credentials(payload: LocalCredentialsRequest) -> dict[str, str]:
         try:
@@ -63,10 +73,41 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
+    @app.post("/api/v1/setup/azure/credentials")
+    def configure_azure_credentials(payload: AzureCredentialsRequest) -> dict[str, str]:
+        try:
+            active_runtime.configure_azure_credentials(payload)
+            return {"status": "stored_in_memory"}
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/v1/setup/aws/credentials")
+    def configure_aws_credentials(payload: AwsCredentialsRequest) -> dict[str, str]:
+        try:
+            active_runtime.configure_aws_credentials(payload)
+            return {"status": "stored_in_memory"}
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/v1/setup/aws/flow-logs")
+    def configure_aws_flow_logs(payload: AwsFlowLogSettingsRequest) -> dict[str, str]:
+        try:
+            active_runtime.configure_aws_flow_logs(payload)
+            return {"status": "stored_in_memory"}
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @app.post("/api/v1/collection/inventory/sync")
     def sync_inventory(collector_id: str) -> dict[str, object]:
         try:
             return active_runtime.sync_inventory(collector_id)
+        except (ControlPlaneClientError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/v1/aws/flow-logs/sync")
+    def sync_aws_flow_logs(collector_id: str) -> dict[str, int]:
+        try:
+            return active_runtime.sync_aws_flow_logs(collector_id)
         except (ControlPlaneClientError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 

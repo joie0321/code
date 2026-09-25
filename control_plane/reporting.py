@@ -103,6 +103,61 @@ def connection_report(
     return report
 
 
+def detailed_connection_report(
+    session: Session,
+    collector_id: str,
+    observed_after: datetime | None = None,
+    observed_before: datetime | None = None,
+) -> list[dict[str, object]]:
+    """Aggregate connection evidence for the detailed engineer-facing export."""
+
+    inventory = _active_inventory(session, collector_id)
+    vms_by_uuid = {vm.vm_uuid: vm for vm in inventory}
+    vms_by_ip = {ip: vm for vm in inventory for ip in vm.ips.split(",") if ip}
+    aggregated: dict[tuple[str, str, str], dict[str, object]] = {}
+    for observation in _observations(session, collector_id, observed_after, observed_before):
+        source = vms_by_uuid.get(observation.source_vm_uuid)
+        if source is None:
+            continue
+        destination = vms_by_ip.get(observation.destination_ip)
+        key = (source.vm_uuid, observation.destination_ip, observation.protocol)
+        row = aggregated.setdefault(
+            key,
+            {
+                "source": source.name,
+                "source_ips": set(),
+                "destination": (destination.hostname or destination.name)
+                if destination
+                else "External",
+                "destination_ip": observation.destination_ip,
+                "protocol": observation.protocol.upper(),
+                "destination_ports": set(),
+            },
+        )
+        row["source_ips"].add(observation.source_ip)  # type: ignore[union-attr]
+        row["destination_ports"].add(observation.destination_port)  # type: ignore[union-attr]
+
+    rows = [
+        {
+            "source": row["source"],
+            "source_ips": ", ".join(sorted(row["source_ips"])),
+            "destination": row["destination"],
+            "destination_ip": row["destination_ip"],
+            "protocol": row["protocol"],
+            "destination_ports": ", ".join(str(port) for port in sorted(row["destination_ports"])),
+        }
+        for row in aggregated.values()
+    ]
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row["source"]),
+            str(row["destination"]),
+            str(row["protocol"]),
+        ),
+    )
+
+
 def migration_waves(
     session: Session,
     collector_id: str,

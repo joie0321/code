@@ -57,7 +57,7 @@ class ConnectionObservation(BaseModel):
     destination_ip: str
     destination_port: int = Field(ge=1, le=65535)
     protocol: str = Field(default="tcp", pattern=r"^(tcp|udp)$")
-    collector_type: str = Field(pattern=r"^(ipfix|guest)$")
+    collector_type: str = Field(pattern=r"^(ipfix|guest|aws_vpc_flow_logs)$")
     observed_at: datetime
     process: str | None = Field(default=None, max_length=512)
 

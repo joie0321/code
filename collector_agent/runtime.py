@@ -3,16 +3,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from threading import Event, Lock, Thread
 from typing import Any
 
 from pydantic import SecretStr
 
+from collector_agent.aws import AwsCredentials
+from collector_agent.aws import fetch_vms as fetch_aws_vms
+from collector_agent.aws_flow_logs import (
+    AwsFlowLogError,
+    AwsFlowLogReadResult,
+    AwsFlowLogSettings,
+    fetch_flow_log_observations,
+)
+from collector_agent.azure import AzureCredentials
+from collector_agent.azure import fetch_vms as fetch_azure_vms
 from collector_agent.client import ControlPlaneClient, ControlPlaneClientError
 from collector_agent.config import AgentSettings
 from collector_agent.ipfix import IpfixFlow, IpfixListener
 from collector_agent.schemas import (
+    AwsCredentialsRequest,
+    AwsFlowLogSettingsRequest,
+    AzureCredentialsRequest,
     IpfixStartRequest,
     LocalCredentialsRequest,
     ReconnectRequest,
@@ -38,7 +51,16 @@ class _SourceIdentity:
 class _SourceProfile:
     identity: _SourceIdentity
     display_name: str
+    source_type: str = "vmware"
     vcenter_credentials: VCenterCredentials | None = None
+    azure_credentials: AzureCredentials | None = None
+    aws_credentials: AwsCredentials | None = None
+    aws_flow_log_settings: AwsFlowLogSettings | None = None
+    aws_flow_log_object_keys: set[str] = field(default_factory=set)
+    aws_flow_log_last_sync_at: datetime | None = None
+    aws_flow_log_objects_processed: int = 0
+    aws_flow_log_observations_uploaded: int = 0
+    aws_flow_log_last_error: str | None = None
     guest_password: SecretStr | None = None
     observation_sequence: int = 0
     inventory_sequence: int = 0
@@ -61,12 +83,18 @@ class AgentRuntime:
         client_type: type[ControlPlaneClient] = ControlPlaneClient,
         inventory_fetcher: Any = fetch_vms,
         exporter_fetcher: Any = fetch_exporter_candidates,
+        azure_inventory_fetcher: Any = fetch_azure_vms,
+        aws_inventory_fetcher: Any = fetch_aws_vms,
+        aws_flow_log_fetcher: Any = fetch_flow_log_observations,
     ):
         settings.validate_runtime()
         self._settings = settings
         self._client_type = client_type
         self._inventory_fetcher = inventory_fetcher
         self._exporter_fetcher = exporter_fetcher
+        self._azure_inventory_fetcher = azure_inventory_fetcher
+        self._aws_inventory_fetcher = aws_inventory_fetcher
+        self._aws_flow_log_fetcher = aws_flow_log_fetcher
         self._lock = Lock()
         self._stop = Event()
         self._sources: dict[str, _SourceProfile] = {}
@@ -88,6 +116,7 @@ class AgentRuntime:
         profile = _SourceProfile(
             identity=_SourceIdentity(request.control_plane_url, collector_id, agent_token),
             display_name=request.display_name,
+            source_type=request.source_type,
             observation_sequence=self._next_sequence(result, "next_observation_sequence") - 1,
             inventory_sequence=self._next_sequence(result, "next_inventory_sequence") - 1,
         )
@@ -126,12 +155,25 @@ class AgentRuntime:
                 self._sources[collector_id] = _SourceProfile(
                     identity=_SourceIdentity(request.control_plane_url, collector_id, agent_token),
                     display_name=request.display_name or collector_id,
+                    source_type=request.source_type,
                     observation_sequence=self._next_sequence(result, "next_observation_sequence")
                     - 1,
                     inventory_sequence=self._next_sequence(result, "next_inventory_sequence") - 1,
                 )
         self._start_heartbeat_thread()
         return {"collector_id": collector_id, "status": "reconnected"}
+
+    def unregister(self, collector_id: str) -> dict[str, str]:
+        """Remove one source from this appliance without deleting control-plane history."""
+
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            for address in profile.exporters:
+                self._exporter_source_ids.pop(address, None)
+            self._sources.pop(collector_id)
+            all_exporters = sorted(self._exporter_source_ids)
+        self._restart_ipfix_listener(all_exporters)
+        return {"collector_id": collector_id, "status": "unregistered"}
 
     def configure_credentials(self, request: LocalCredentialsRequest) -> None:
         """Keep source credentials in appliance memory; never log or upload them."""
@@ -140,6 +182,8 @@ class AgentRuntime:
             raise ValueError("vCenter TLS verification is required outside development")
         with self._lock:
             profile = self._source_or_raise(request.collector_id)
+            if profile.source_type != "vmware":
+                raise ValueError("Select a VMware source before configuring vCenter credentials")
             profile.vcenter_credentials = VCenterCredentials(
                 request.vcenter_host,
                 request.vcenter_username,
@@ -148,6 +192,120 @@ class AgentRuntime:
             )
             profile.guest_password = request.guest_password
             profile.last_error = None
+
+    def configure_azure_credentials(self, request: AzureCredentialsRequest) -> None:
+        """Keep Azure application credentials in appliance memory only."""
+
+        with self._lock:
+            profile = self._source_or_raise(request.collector_id)
+            if profile.source_type != "azure":
+                raise ValueError("Select an Azure source before configuring Azure credentials")
+            profile.azure_credentials = AzureCredentials(
+                tenant_id=request.azure_tenant_id,
+                client_id=request.azure_client_id,
+                client_secret=request.azure_client_secret,
+                subscription_ids=request.subscription_ids,
+            )
+            profile.last_error = None
+
+    def configure_aws_credentials(self, request: AwsCredentialsRequest) -> None:
+        """Keep AWS authentication configuration in appliance memory only."""
+
+        with self._lock:
+            profile = self._source_or_raise(request.collector_id)
+            if profile.source_type != "aws":
+                raise ValueError("Select an AWS source before configuring AWS credentials")
+            profile.aws_credentials = AwsCredentials(
+                region_name=request.aws_region,
+                access_key_id=request.aws_access_key_id,
+                secret_access_key=request.aws_secret_access_key,
+                session_token=request.aws_session_token,
+            )
+            profile.last_error = None
+
+    def configure_aws_flow_logs(self, request: AwsFlowLogSettingsRequest) -> None:
+        """Configure a read-only, customer-owned S3 VPC Flow Log location."""
+
+        with self._lock:
+            profile = self._source_or_raise(request.collector_id)
+            if profile.source_type != "aws":
+                raise ValueError("Select an AWS source before configuring VPC Flow Logs")
+            profile.aws_flow_log_settings = AwsFlowLogSettings(
+                bucket_name=request.s3_bucket_name,
+                prefix=request.s3_prefix,
+            )
+            profile.aws_flow_log_object_keys.clear()
+            profile.aws_flow_log_last_error = None
+
+    def sync_aws_flow_logs(self, collector_id: str) -> dict[str, int]:
+        """Read unseen VPC Flow Log objects and upload inventory-matched observations."""
+
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            if profile.source_type != "aws":
+                raise ValueError("VPC Flow Logs are available only for AWS sources")
+            if profile.aws_credentials is None:
+                raise ValueError("Configure AWS credentials before synchronizing VPC Flow Logs")
+            if profile.aws_flow_log_settings is None:
+                raise ValueError("Configure the S3 VPC Flow Log location before synchronizing")
+            credentials = profile.aws_credentials
+            settings = profile.aws_flow_log_settings
+            known_object_keys = set(profile.aws_flow_log_object_keys)
+            source_vm_uuid_by_ip = dict(profile.source_vm_uuid_by_ip)
+        try:
+            result: AwsFlowLogReadResult = self._aws_flow_log_fetcher(
+                credentials, settings, known_object_keys
+            )
+        except AwsFlowLogError as error:
+            message = str(error)
+            with self._lock:
+                self._source_or_raise(collector_id).aws_flow_log_last_error = message
+            raise ValueError(message) from error
+        except Exception as error:
+            message = "AWS VPC Flow Log synchronization failed. Check local agent settings."
+            with self._lock:
+                self._source_or_raise(collector_id).aws_flow_log_last_error = message
+            raise ValueError(message) from error
+        observations = [
+            {
+                "source_vm_uuid": source_vm_uuid_by_ip[item.source_ip],
+                "source_ip": item.source_ip,
+                "destination_ip": item.destination_ip,
+                "destination_port": item.destination_port,
+                "protocol": item.protocol,
+                "collector_type": "aws_vpc_flow_logs",
+                "observed_at": item.observed_at.isoformat(),
+                "process": "aws-vpc-flow-log",
+            }
+            for item in result.observations
+            if item.source_ip in source_vm_uuid_by_ip
+        ]
+        accepted = 0
+        try:
+            for offset in range(0, len(observations), 5_000):
+                accepted += self.upload_observations(
+                    collector_id, observations[offset : offset + 5_000]
+                )["accepted"]
+        except ControlPlaneClientError as error:
+            # ControlPlaneClient exposes only bounded, safe diagnostic text.
+            # Preserve it so the appliance operator can distinguish an expired
+            # token from a control-plane schema mismatch or connectivity issue.
+            message = str(error)
+            with self._lock:
+                self._source_or_raise(collector_id).aws_flow_log_last_error = message
+            raise
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            profile.aws_flow_log_object_keys.update(result.processed_object_keys)
+            profile.aws_flow_log_last_sync_at = datetime.now(UTC)
+            profile.aws_flow_log_objects_processed += len(result.processed_object_keys)
+            profile.aws_flow_log_observations_uploaded += accepted
+            profile.aws_flow_log_last_error = None
+        return {
+            "objects_found": result.objects_found,
+            "objects_processed": len(result.processed_object_keys),
+            "observations_uploaded": accepted,
+        }
 
     def upload_observations(
         self, collector_id: str, observations: list[dict[str, Any]]
@@ -167,23 +325,53 @@ class AgentRuntime:
     def sync_inventory(self, collector_id: str) -> dict[str, Any]:
         with self._lock:
             profile = self._source_or_raise(collector_id)
-            credentials, identity = profile.vcenter_credentials, profile.identity
-        if credentials is None:
-            raise ValueError("Configure vCenter credentials before inventory synchronization")
+            source_type = profile.source_type
+            vmware_credentials = profile.vcenter_credentials
+            azure_credentials = profile.azure_credentials
+            aws_credentials = profile.aws_credentials
+            identity = profile.identity
+        if source_type == "vmware":
+            if vmware_credentials is None:
+                raise ValueError("Configure vCenter credentials before inventory synchronization")
+            inventory_fetcher, credentials, source_label = (
+                self._inventory_fetcher,
+                vmware_credentials,
+                "vCenter",
+            )
+        elif source_type == "azure":
+            if azure_credentials is None:
+                raise ValueError("Configure Azure credentials before inventory synchronization")
+            inventory_fetcher, credentials, source_label = (
+                self._azure_inventory_fetcher,
+                azure_credentials,
+                "Azure",
+            )
+        elif source_type == "aws":
+            if aws_credentials is None:
+                raise ValueError("Configure AWS credentials before inventory synchronization")
+            inventory_fetcher, credentials, source_label = (
+                self._aws_inventory_fetcher,
+                aws_credentials,
+                "AWS",
+            )
+        else:  # Defensive: schema validation prevents this for new registrations.
+            raise ValueError("This source type does not support inventory synchronization")
         try:
-            records: list[VmRecord] = self._inventory_fetcher(credentials)
+            records: list[VmRecord] = inventory_fetcher(credentials)
         except Exception as error:
             self._set_error(
                 collector_id,
-                "vCenter inventory synchronization failed. Check local agent settings.",
+                f"{source_label} inventory synchronization failed. Check local agent settings.",
             )
             raise ValueError(
-                "vCenter inventory synchronization failed. Check local agent settings."
+                f"{source_label} inventory synchronization failed. Check local agent settings."
             ) from error
-        try:
-            candidates: list[ExporterCandidate] = self._exporter_fetcher(credentials)
-        except Exception:
-            candidates = []
+        candidates: list[ExporterCandidate] = []
+        if source_type == "vmware":
+            try:
+                candidates = self._exporter_fetcher(credentials)
+            except Exception:
+                candidates = []
         # vCenter can expose the same BIOS UUID through more than one inventory path. The
         # control plane identifies inventory VMs by UUID, so retain one deterministic record.
         payload_vms_by_uuid = {record.vm_uuid: self._vm_payload(record) for record in records}
@@ -243,6 +431,8 @@ class AgentRuntime:
 
         with self._lock:
             profile = self._source_or_raise(collector_id)
+            if profile.source_type != "vmware":
+                raise ValueError("IPFIX is available only for VMware sources")
             candidates = [
                 {
                     "host_name": candidate.host_name,
@@ -264,6 +454,8 @@ class AgentRuntime:
     def start_ipfix(self, collector_id: str, request: IpfixStartRequest) -> dict[str, object]:
         with self._lock:
             profile = self._source_or_raise(collector_id)
+            if profile.source_type != "vmware":
+                raise ValueError("IPFIX is available only for VMware sources")
             candidate_ips = {
                 address
                 for candidate in profile.exporter_candidates
@@ -299,6 +491,8 @@ class AgentRuntime:
     def stop_ipfix(self, collector_id: str) -> dict[str, object]:
         with self._lock:
             profile = self._source_or_raise(collector_id)
+            if profile.source_type != "vmware":
+                raise ValueError("IPFIX is available only for VMware sources")
             for address in profile.exporters:
                 self._exporter_source_ids.pop(address, None)
             profile.exporters.clear()
@@ -410,11 +604,27 @@ class AgentRuntime:
         self, profile: _SourceProfile, listener: dict[str, object]
     ) -> dict[str, object]:
         source_listener = self._source_listener_status(listener, sorted(profile.exporters))
-        ipfix_status, ipfix_detail = self._ipfix_health(profile, source_listener)
+        if profile.source_type == "vmware":
+            ipfix_status, ipfix_detail = self._ipfix_health(profile, source_listener)
+        else:
+            ipfix_status, ipfix_detail = (
+                "Not applicable",
+                f"IPFIX is not used by {profile.source_type.title()} sources.",
+            )
+        aws_flow_log_status, aws_flow_log_detail = self._aws_flow_log_health(profile)
         return {
             "collector_id": profile.identity.collector_id,
             "display_name": profile.display_name,
+            "source_type": profile.source_type,
             "vcenter_configured": profile.vcenter_credentials is not None,
+            "azure_configured": profile.azure_credentials is not None,
+            "aws_configured": profile.aws_credentials is not None,
+            "aws_flow_logs_configured": profile.aws_flow_log_settings is not None,
+            "aws_flow_log_status": aws_flow_log_status,
+            "aws_flow_log_detail": aws_flow_log_detail,
+            "aws_flow_log_last_sync_at": self._timestamp(profile.aws_flow_log_last_sync_at),
+            "aws_flow_log_objects_processed": profile.aws_flow_log_objects_processed,
+            "aws_flow_log_observations_uploaded": profile.aws_flow_log_observations_uploaded,
             "guest_credentials_configured": profile.guest_password is not None,
             "last_heartbeat_at": self._timestamp(profile.last_heartbeat_at),
             "last_error": profile.last_error,
@@ -443,6 +653,20 @@ class AgentRuntime:
                 "Flows arrived but did not match a powered-on inventory VM.",
             )
         return "OK", "IPFIX flow observations are uploading for this source."
+
+    @staticmethod
+    def _aws_flow_log_health(profile: _SourceProfile) -> tuple[str, str]:
+        if profile.source_type != "aws":
+            return "Not applicable", "VPC Flow Logs are used only by AWS sources."
+        if profile.aws_flow_log_settings is None:
+            return "Not configured", "No S3 VPC Flow Log location is configured."
+        if profile.aws_flow_log_last_error:
+            return "Error", profile.aws_flow_log_last_error
+        if profile.aws_flow_log_last_sync_at is None:
+            return "Waiting", "No VPC Flow Log synchronization has completed yet."
+        if profile.aws_flow_log_observations_uploaded == 0:
+            return "Waiting for traffic", "No accepted inventory-matched VPC flows were found yet."
+        return "OK", "AWS VPC Flow Log observations are uploading for this source."
 
     @staticmethod
     def _rejected_exporter_rows(listener: dict[str, object]) -> list[dict[str, object]]:
@@ -504,6 +728,20 @@ class AgentRuntime:
                         if current:
                             current.last_heartbeat_at = datetime.now(UTC)
                             current.last_error = None
+                    should_sync_aws_flow_logs = (
+                        profile.source_type == "aws"
+                        and profile.aws_flow_log_settings is not None
+                        and (
+                            profile.aws_flow_log_last_sync_at is None
+                            or datetime.now(UTC) - profile.aws_flow_log_last_sync_at
+                            >= timedelta(minutes=5)
+                        )
+                    )
+                    if should_sync_aws_flow_logs:
+                        try:
+                            self.sync_aws_flow_logs(profile.identity.collector_id)
+                        except (ControlPlaneClientError, ValueError):
+                            pass
                 except ControlPlaneClientError:
                     self._set_error(
                         profile.identity.collector_id,

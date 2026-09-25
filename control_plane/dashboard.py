@@ -9,15 +9,25 @@ import streamlit as st
 
 _GRAPH_EPHEMERAL_PORT_START = 32768
 _GRAPH_EPHEMERAL_PORT_END = 65535
+_NAVIGATION_PAGES = (
+    "Agent Collector's Status",
+    "Enroll Agent Collector",
+    "VM/Server Inventory",
+    "Migration Waves",
+)
 
 try:  # Supports `streamlit run control_plane/dashboard.py` from the project root.
     from control_plane.config import ControlPlaneSettings
     from control_plane.dashboard_client import ControlPlaneDashboardClient, DashboardClientError
+    from control_plane.detailed_report import build_detailed_report, detailed_report_filename
+    from control_plane.executive_report import build_executive_report, executive_report_filename
 except ModuleNotFoundError:  # pragma: no cover - Streamlit executes the file as a script.
     from config import ControlPlaneSettings
     from dashboard_client import ControlPlaneDashboardClient, DashboardClientError
+    from detailed_report import build_detailed_report, detailed_report_filename
+    from executive_report import build_executive_report, executive_report_filename
 
-st.set_page_config(page_title="VMware Migration Control Plane", page_icon="🧭", layout="wide")
+st.set_page_config(page_title="Migration Discovery Dashboard", page_icon="🧭", layout="wide")
 st.markdown(
     """
     <style>
@@ -264,6 +274,40 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
         "Potential ephemeral ports (32768–65535) are hidden from graph labels; "
         "full port values remain in the observed-connections table."
     )
+    selected_collector = next(
+        item for item in collectors if item["collector_id"] == selected_collector_id
+    )
+    try:
+        report_created_at = datetime.now(UTC)
+        executive_report = build_executive_report(
+            selected_collector, summary, waves, range_label, report_created_at
+        )
+        detailed_connections = client.detailed_connections(
+            selected_collector_id, observed_after.isoformat(), observed_before.isoformat()
+        )
+        detailed_report = build_detailed_report(
+            selected_collector, waves, detailed_connections, range_label
+        )
+        st.download_button(
+            "Download executive report (PDF)",
+            data=executive_report,
+            file_name=executive_report_filename(
+                selected_collector["display_name"], report_created_at
+            ),
+            mime="application/pdf",
+            key=f"executive_report_{selected_collector_id}_{range_label}",
+        )
+        st.download_button(
+            "Download detailed report (Excel)",
+            data=detailed_report,
+            file_name=detailed_report_filename(
+                selected_collector["display_name"], report_created_at
+            ),
+            mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+            key=f"detailed_report_{selected_collector_id}_{range_label}",
+        )
+    except (DashboardClientError, KeyError, TypeError, ValueError):
+        st.warning("The selected reports could not be generated for the reporting window.")
     cards = st.columns(5)
     with cards[0]:
         card("Migration waves", summary["wave_count"])
@@ -335,11 +379,11 @@ with st.sidebar:
     st.caption("OCI-hosted collector management and dependency reporting.")
     page = st.radio(
         "Navigation",
-        ("Collectors", "VM Inventory", "Migration Waves", "Enroll Collector"),
+        _NAVIGATION_PAGES,
         label_visibility="collapsed",
     )
 
-st.title("VMware Migration Control Plane")
+st.title("Migration Discovery Dashboard")
 st.caption(
     "Customer-side collectors report inventory and dependency telemetry to this OCI service."
 )
@@ -358,8 +402,8 @@ except ValueError as error:
 
 collectors: list[dict[str, object]] = []
 
-if page == "Enroll Collector":
-    st.subheader("Enroll a collector appliance")
+if page == "Enroll Agent Collector":
+    st.subheader("Enroll an agent collector appliance")
     st.warning(
         "Administrator-only operation. The enrollment code is displayed once; copy it directly "
         "into the customer-side collector setup page."
@@ -420,20 +464,51 @@ else:
         st.error(str(error))
         st.stop()
 
-if page == "Collectors":
-    st.subheader("Registered collectors")
+if page == "Agent Collector's Status":
+    st.subheader("Agent Collector's Status")
     online = sum(item["status"] == "online" for item in collectors)
     left, middle, right = st.columns(3)
     with left:
-        card("Registered collectors", len(collectors))
+        card("Registered agent collectors", len(collectors))
     with middle:
-        card("Online collectors", online)
+        card("Online agent collectors", online)
     with right:
-        card("Collectors needing attention", len(collectors) - online)
+        card("Agent collectors needing attention", len(collectors) - online)
     st.divider()
     st.dataframe(collectors, use_container_width=True, hide_index=True)
-elif page == "VM Inventory":
-    st.subheader("Collector VM inventory")
+    if collectors:
+        with st.expander("Delete collector agent and all retained data"):
+            st.warning(
+                "This permanently deletes the selected collector, its VM inventory, observed "
+                "connections, migration-wave data, and reconnection codes. This cannot be undone."
+            )
+            collector_options = {
+                f"{item['display_name']} · {item['tenant_id']} · {item['collector_id']}": item[
+                    "collector_id"
+                ]
+                for item in collectors
+            }
+            selected_for_deletion = st.selectbox(
+                "Collector agent to delete", collector_options, key="delete_collector_agent"
+            )
+            deletion_confirmation = st.text_input(
+                "Type DELETE to confirm permanent removal", key="delete_collector_confirmation"
+            )
+            if st.button(
+                "Permanently delete collector agent",
+                type="secondary",
+                disabled=deletion_confirmation != "DELETE",
+            ):
+                try:
+                    deleted = client.delete_collector(collector_options[selected_for_deletion])
+                    st.success(
+                        f"Collector {deleted['collector_id']} and its retained data were deleted."
+                    )
+                    st.rerun()
+                except DashboardClientError as error:
+                    st.error(str(error))
+elif page == "VM/Server Inventory":
+    st.subheader("VM/Server Inventory")
     if not collectors:
         st.info("No registered collectors are available yet.")
         st.stop()
