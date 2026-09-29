@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -24,9 +26,11 @@ class ControlPlaneSettings(BaseSettings):
     model_config = SettingsConfigDict(env_file=_PROJECT_ROOT / ".env", extra="ignore")
 
     app_env: str = "development"
+    database_mode: Literal["development", "oci_vault", "external", "bundled"] | None = None
     database_url: str = _project_sqlite_url("control_plane.db")
     database_password: SecretStr | None = None
     database_password_secret_ocid: str | None = None
+    database_password_file: Path | None = None
     control_plane_admin_api_key: SecretStr
     control_plane_dashboard_api_url: str = "http://127.0.0.1:8100"
     control_plane_dashboard_api_key: SecretStr | None = None
@@ -49,31 +53,38 @@ class ControlPlaneSettings(BaseSettings):
         return value
 
     def validate_runtime(self) -> None:
-        if self.app_env != "development" and self.database_url.startswith("sqlite"):
-            raise ValueError("SQLite is permitted only in APP_ENV=development")
-        if self.app_env != "development":
-            database = make_url(self.database_url)
-            if database.drivername != "postgresql+psycopg":
-                raise ValueError("Production DATABASE_URL must use postgresql+psycopg")
-            if database.password is not None or self.database_password is not None:
-                raise ValueError(
-                    "Do not place a database password in DATABASE_URL or DATABASE_PASSWORD "
-                    "outside development. Use DATABASE_PASSWORD_SECRET_OCID."
-                )
+        mode = self.effective_database_mode()
+        if mode == "bundled":
+            raise ValueError(
+                "DATABASE_MODE=bundled is not available until the bundled database phase"
+            )
+        if mode == "development":
+            if self.app_env != "development":
+                raise ValueError("DATABASE_MODE=development requires APP_ENV=development")
+            return
+
+        database = make_url(self.database_url)
+        if database.drivername != "postgresql+psycopg":
+            raise ValueError("Production DATABASE_URL must use postgresql+psycopg")
+        if database.password is not None or self.database_password is not None:
+            raise ValueError(
+                "Do not place a database password in DATABASE_URL or DATABASE_PASSWORD "
+                "outside development."
+            )
+        if database.query.get("sslmode") != "verify-full" or not database.query.get("sslrootcert"):
+            raise ValueError("Production DATABASE_URL must set sslmode=verify-full and sslrootcert")
+        self._validate_dashboard_api_endpoint()
+        if mode == "oci_vault":
             if not self.database_password_secret_ocid:
-                raise ValueError("DATABASE_PASSWORD_SECRET_OCID is required outside development")
-            if database.query.get("sslmode") != "verify-full" or not database.query.get(
-                "sslrootcert"
-            ):
                 raise ValueError(
-                    "Production DATABASE_URL must set sslmode=verify-full and sslrootcert"
+                    "DATABASE_PASSWORD_SECRET_OCID is required for DATABASE_MODE=oci_vault"
                 )
-            if not self.control_plane_dashboard_api_url.startswith("https://"):
+            if self.database_password_file is not None:
                 raise ValueError(
-                    "CONTROL_PLANE_DASHBOARD_API_URL must use HTTPS outside development"
+                    "DATABASE_PASSWORD_FILE is not permitted for DATABASE_MODE=oci_vault"
                 )
-            if self.control_plane_dashboard_api_key is None:
-                raise ValueError("CONTROL_PLANE_DASHBOARD_API_KEY is required outside development")
+        elif mode == "external":
+            self._read_database_password_file()
 
     def dashboard_api_key(self) -> SecretStr:
         """Use a separate read-only dashboard key in production."""
@@ -95,9 +106,12 @@ class ControlPlaneSettings(BaseSettings):
         return database.set(password=password).render_as_string(hide_password=False)
 
     def _database_password(self) -> str:
-        if self.app_env == "development" and self.database_password is not None:
+        mode = self.effective_database_mode()
+        if mode == "development" and self.database_password is not None:
             return self.database_password.get_secret_value()
-        if not self.database_password_secret_ocid:
+        if mode == "external":
+            return self._read_database_password_file()
+        if mode != "oci_vault" or not self.database_password_secret_ocid:
             raise ValueError("A database password source is required for PostgreSQL")
         try:
             import oci
@@ -112,3 +126,49 @@ class ControlPlaneSettings(BaseSettings):
                 "Unable to retrieve the database password from OCI Vault using the "
                 "instance principal. Check the dynamic-group policy and secret OCID."
             ) from error
+
+    def effective_database_mode(self) -> Literal["development", "oci_vault", "external", "bundled"]:
+        """Resolve a mode while preserving existing OCI deployment configuration."""
+
+        if self.database_mode is not None:
+            return self.database_mode
+        return "development" if self.app_env == "development" else "oci_vault"
+
+    def _read_database_password_file(self) -> str:
+        """Read a bounded deployment secret without exposing its contents in errors."""
+
+        if self.database_password_file is None:
+            raise ValueError("DATABASE_PASSWORD_FILE is required for DATABASE_MODE=external")
+        path = self.database_password_file
+        if not path.is_absolute():
+            raise ValueError("DATABASE_PASSWORD_FILE must be an absolute path")
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise ValueError("Unable to read DATABASE_PASSWORD_FILE") from error
+        password = content.rstrip("\r\n")
+        if not password or "\x00" in password or len(password) > 4096:
+            raise ValueError("DATABASE_PASSWORD_FILE contains an invalid password value")
+        return password
+
+    def _validate_dashboard_api_endpoint(self) -> None:
+        """Allow HTTP only for a local development dashboard-to-API connection."""
+
+        endpoint = urlsplit(self.control_plane_dashboard_api_url)
+        if endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
+            raise ValueError("CONTROL_PLANE_DASHBOARD_API_URL must be a plain API origin")
+        if self.app_env == "development":
+            if endpoint.scheme not in {"http", "https"} or endpoint.hostname not in {
+                "127.0.0.1",
+                "localhost",
+                "::1",
+            }:
+                raise ValueError(
+                    "Development external PostgreSQL mode permits the dashboard API only on "
+                    "localhost, 127.0.0.1, or ::1"
+                )
+            return
+        if endpoint.scheme != "https":
+            raise ValueError("CONTROL_PLANE_DASHBOARD_API_URL must use HTTPS outside development")
+        if self.control_plane_dashboard_api_key is None:
+            raise ValueError("CONTROL_PLANE_DASHBOARD_API_KEY is required outside development")

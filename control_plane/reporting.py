@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from control_plane.models import InventoryVm, Observation
@@ -44,8 +44,33 @@ def _active_inventory(session: Session, collector_id: str) -> list[InventoryVm]:
     ).all()
 
 
+def _inventory(session: Session, collector_id: str) -> list[InventoryVm]:
+    return session.scalars(
+        select(InventoryVm).where(InventoryVm.collector_id == collector_id)
+    ).all()
+
+
 def _eligible_vms(vms: list[InventoryVm]) -> list[InventoryVm]:
-    return [vm for vm in vms if (vm.power_state or "").lower() != "poweredoff"]
+    return [
+        vm
+        for vm in vms
+        if vm.is_active and (vm.power_state or "").casefold() == "poweredon"
+    ]
+
+
+def _unavailable_reason(vm: InventoryVm) -> str:
+    if not vm.is_active:
+        return "VM is not present in the latest inventory snapshot."
+    state = vm.power_state or "unknown"
+    return f"VM power state is {state}; only poweredOn VMs are eligible for a current wave."
+
+
+def _vms_by_ip(vms: list[InventoryVm]) -> dict[str, InventoryVm]:
+    """Prefer current inventory assignments over retained inactive VM addresses."""
+
+    by_ip = {ip: vm for vm in vms if not vm.is_active for ip in vm.ips.split(",") if ip}
+    by_ip.update({ip: vm for vm in vms if vm.is_active for ip in vm.ips.split(",") if ip})
+    return by_ip
 
 
 def _observations(
@@ -71,9 +96,9 @@ def connection_report(
 ) -> list[dict[str, object]]:
     """Return bounded, collector-local observations without external DNS lookups."""
 
-    inventory = _active_inventory(session, collector_id)
+    inventory = _inventory(session, collector_id)
     vms_by_uuid = {vm.vm_uuid: vm for vm in inventory}
-    vms_by_ip = {ip: vm for vm in inventory for ip in vm.ips.split(",") if ip}
+    vms_by_ip = _vms_by_ip(inventory)
     report: list[dict[str, object]] = []
     observations = _observations(session, collector_id, observed_after, observed_before)
     for observation in observations[:limit]:
@@ -103,6 +128,80 @@ def connection_report(
     return report
 
 
+def wave_connection_report(
+    session: Session,
+    collector_id: str,
+    vm_uuids: list[str],
+    observed_after: datetime | None = None,
+    observed_before: datetime | None = None,
+    page: int = 1,
+    page_size: int = 100,
+) -> dict[str, object]:
+    """Return one bounded page of evidence for the selected wave VMs.
+
+    Filtering happens in the database before pagination.  This prevents a busy
+    collector's newest global observations from hiding older evidence for a
+    smaller selected wave.
+    """
+
+    selected_vm_uuids = set(vm_uuids)
+    inventory = _inventory(session, collector_id)
+    selected_vms = [vm for vm in inventory if vm.vm_uuid in selected_vm_uuids]
+    selected_vm_uuids = {vm.vm_uuid for vm in selected_vms}
+    selected_ips = {ip for vm in selected_vms for ip in vm.ips.split(",") if ip}
+    if not selected_vm_uuids:
+        return {"items": [], "page": 1, "page_size": page_size, "total": 0}
+
+    filters = [Observation.collector_id == collector_id]
+    if observed_after:
+        filters.append(Observation.observed_at >= _utc_naive(observed_after))
+    if observed_before:
+        filters.append(Observation.observed_at <= _utc_naive(observed_before))
+    endpoint_filters = [Observation.source_vm_uuid.in_(selected_vm_uuids)]
+    if selected_ips:
+        endpoint_filters.append(Observation.destination_ip.in_(selected_ips))
+    filters.append(or_(*endpoint_filters))
+
+    total = session.scalar(select(func.count()).select_from(Observation).where(*filters)) or 0
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    current_page = min(page, total_pages)
+    observations = session.scalars(
+        select(Observation)
+        .where(*filters)
+        .order_by(Observation.observed_at.desc())
+        .offset((current_page - 1) * page_size)
+        .limit(page_size)
+    ).all()
+    all_vms_by_uuid = {vm.vm_uuid: vm for vm in inventory}
+    all_vms_by_ip = _vms_by_ip(inventory)
+    items: list[dict[str, object]] = []
+    for observation in observations:
+        source = all_vms_by_uuid.get(observation.source_vm_uuid)
+        if source is None:
+            continue
+        destination = all_vms_by_ip.get(observation.destination_ip)
+        items.append(
+            {
+                "source_vm_uuid": source.vm_uuid,
+                "source_vm_name": source.name,
+                "destination_ip": observation.destination_ip,
+                "destination_vm_uuid": destination.vm_uuid if destination else None,
+                "destination_vm_name": destination.name if destination else None,
+                "destination_hostname": (destination.hostname or destination.name)
+                if destination
+                else None,
+                "destination_power_state": destination.power_state if destination else None,
+                "destination_port": observation.destination_port,
+                "protocol": observation.protocol,
+                "traffic_class": _traffic_class(observation.protocol, observation.destination_port),
+                "collector_type": observation.collector_type,
+                "process": observation.process,
+                "observed_at": observation.observed_at.isoformat(),
+            }
+        )
+    return {"items": items, "page": current_page, "page_size": page_size, "total": total}
+
+
 def detailed_connection_report(
     session: Session,
     collector_id: str,
@@ -111,9 +210,9 @@ def detailed_connection_report(
 ) -> list[dict[str, object]]:
     """Aggregate connection evidence for the detailed engineer-facing export."""
 
-    inventory = _active_inventory(session, collector_id)
+    inventory = _inventory(session, collector_id)
     vms_by_uuid = {vm.vm_uuid: vm for vm in inventory}
-    vms_by_ip = {ip: vm for vm in inventory for ip in vm.ips.split(",") if ip}
+    vms_by_ip = _vms_by_ip(inventory)
     aggregated: dict[tuple[str, str, str], dict[str, object]] = {}
     for observation in _observations(session, collector_id, observed_after, observed_before):
         source = vms_by_uuid.get(observation.source_vm_uuid)
@@ -166,10 +265,14 @@ def migration_waves(
 ) -> list[dict[str, object]]:
     """Build waves from connected active, powered-on VMs in one collector inventory."""
 
-    eligible = _eligible_vms(_active_inventory(session, collector_id))
+    inventory = _inventory(session, collector_id)
+    eligible = _eligible_vms(inventory)
     names_by_uuid = {vm.vm_uuid: vm.name for vm in eligible}
+    inventory_by_uuid = {vm.vm_uuid: vm for vm in inventory}
     vm_uuid_by_ip = {ip: vm.vm_uuid for vm in eligible for ip in vm.ips.split(",") if ip}
+    known_vm_by_ip = _vms_by_ip(inventory)
     graph: dict[str, set[str]] = defaultdict(set)
+    unavailable_by_eligible_vm: dict[str, dict[str, dict[str, object]]] = defaultdict(dict)
     for observation in _observations(session, collector_id, observed_after, observed_before):
         if observation.protocol != "tcp":
             continue
@@ -178,6 +281,40 @@ def migration_waves(
         if source_uuid in names_by_uuid and destination_uuid and destination_uuid != source_uuid:
             graph[source_uuid].add(destination_uuid)
             graph[destination_uuid].add(source_uuid)
+            continue
+
+        source = inventory_by_uuid.get(source_uuid)
+        destination = known_vm_by_ip.get(observation.destination_ip)
+        endpoints = (
+            (source_uuid, source),
+            (destination.vm_uuid, destination) if destination else (None, None),
+        )
+        eligible_endpoints = [
+            (vm_uuid, vm)
+            for vm_uuid, vm in endpoints
+            if vm_uuid in names_by_uuid and vm is not None
+        ]
+        unavailable_endpoints = [
+            vm
+            for vm_uuid, vm in endpoints
+            if vm_uuid not in names_by_uuid and vm is not None
+        ]
+        for eligible_uuid, _ in eligible_endpoints:
+            for unavailable in unavailable_endpoints:
+                if unavailable.vm_uuid == eligible_uuid:
+                    continue
+                dependency = unavailable_by_eligible_vm[eligible_uuid].setdefault(
+                    unavailable.vm_uuid,
+                    {
+                        "vm_uuid": unavailable.vm_uuid,
+                        "name": unavailable.name,
+                        "power_state": unavailable.power_state,
+                        "is_active": unavailable.is_active,
+                        "reason": _unavailable_reason(unavailable),
+                        "connection_count": 0,
+                    },
+                )
+                dependency["connection_count"] += 1
 
     components: list[set[str]] = []
     remaining = set(names_by_uuid)
@@ -200,6 +337,14 @@ def migration_waves(
             "wave": index,
             "server_vm_uuids": sorted(component),
             "server_names": [names_by_uuid[vm_uuid] for vm_uuid in sorted(component)],
+            "inactive_internal_dependencies": sorted(
+                {
+                    dependency["vm_uuid"]: dependency
+                    for vm_uuid in component
+                    for dependency in unavailable_by_eligible_vm.get(vm_uuid, {}).values()
+                }.values(),
+                key=lambda dependency: (str(dependency["name"]), str(dependency["vm_uuid"])),
+            ),
             "reason": (
                 "Observed TCP dependencies connect these servers; review external and shared "
                 "service dependencies before cutover."

@@ -112,3 +112,18 @@ class InventoryVm(Base):
     power_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class InventoryVmState(Base):
+    """Append-only inventory state evidence used to explain wave eligibility."""
+
+    __tablename__ = "inventory_vm_states"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    collector_id: Mapped[str] = mapped_column(ForeignKey("collectors.id"), index=True)
+    vm_uuid: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    ips: Mapped[str] = mapped_column(Text, default="")
+    power_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, index=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

@@ -164,23 +164,36 @@ def _wave_graph(wave: dict[str, object], connections: list[dict[str, object]]) -
     vm_names = list(wave["server_names"])
     names_by_uuid = dict(zip(vm_uuids, vm_names, strict=True))
     node_ids = {vm_uuid: f"vm_{index}" for index, vm_uuid in enumerate(vm_uuids, start=1)}
+    inactive_dependencies = list(wave.get("inactive_internal_dependencies", []))
+    inactive_by_uuid = {
+        str(item["vm_uuid"]): item
+        for item in inactive_dependencies
+        if isinstance(item, dict) and isinstance(item.get("vm_uuid"), str)
+    }
+    inactive_node_ids = {
+        vm_uuid: f"inactive_{index}"
+        for index, vm_uuid in enumerate(inactive_by_uuid, start=1)
+    }
     edge_ports: dict[tuple[str, str], set[str]] = {}
     edge_dynamic_protocols: dict[tuple[str, str], set[str]] = {}
     external_ids: dict[str, str] = {}
 
     for connection in connections:
         source_uuid = connection.get("source_vm_uuid")
-        if source_uuid not in node_ids:
+        source_id = node_ids.get(source_uuid) or inactive_node_ids.get(source_uuid)
+        if source_id is None:
             continue
         destination_uuid = connection.get("destination_vm_uuid")
         if destination_uuid in node_ids:
             destination_id = node_ids[destination_uuid]
+        elif destination_uuid in inactive_node_ids:
+            destination_id = inactive_node_ids[destination_uuid]
         else:
             destination_ip = str(connection.get("destination_ip", "unknown"))
             destination_id = external_ids.setdefault(
                 destination_ip, f"external_{len(external_ids) + 1}"
             )
-        edge = (node_ids[source_uuid], destination_id)
+        edge = (source_id, destination_id)
         protocol = str(connection.get("protocol", "tcp"))
         port = connection.get("destination_port")
         if (
@@ -213,6 +226,13 @@ def _wave_graph(wave: dict[str, object], connections: list[dict[str, object]]) -
         lines.append(
             f'{node_id} [label="{_escape_dot(_compact_graph_label(names_by_uuid[vm_uuid]))}"];'
         )
+    for vm_uuid, node_id in inactive_node_ids.items():
+        dependency = inactive_by_uuid[vm_uuid]
+        name = _escape_dot(_compact_graph_label(dependency.get("name", vm_uuid)))
+        lines.append(
+            f'{node_id} [label="Unavailable\\n{name}", style="rounded,dashed,filled", '
+            'color="#a47527", fillcolor="#fef3c7", fontcolor="#3b2f10"];'
+        )
     for destination_ip, node_id in external_ids.items():
         lines.append(
             f'{node_id} [label="External\\n{_escape_dot(_compact_graph_label(destination_ip))}", '
@@ -235,8 +255,8 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
 
     st.subheader("Migration waves")
     st.write(
-        "Review TCP connections uploaded by one collector. Powered-off VMs are excluded from "
-        "wave assignment; external destinations are shown only as dependencies."
+        "Review TCP connections uploaded by one collector. Only currently powered-on VMs "
+        "form move groups; unavailable internal VMs remain visible as review dependencies."
     )
     if not collectors:
         st.info("No registered collectors are available yet.")
@@ -332,6 +352,27 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
     st.divider()
     st.markdown(f"#### {html.escape(selected_wave_label)}")
     st.caption(str(selected_wave["reason"]))
+    inactive_dependencies = list(selected_wave.get("inactive_internal_dependencies", []))
+    if inactive_dependencies:
+        st.warning(
+            "This move group has historical TCP dependencies on unavailable internal VMs. "
+            "They do not merge active move groups, but must be reviewed before cutover."
+        )
+        st.dataframe(
+            [
+                {
+                    "Unavailable internal VM": item.get("name"),
+                    "Power state": item.get("power_state") or "unknown",
+                    "Present in latest inventory": item.get("is_active"),
+                    "Observed TCP connections": item.get("connection_count"),
+                    "Reason": item.get("reason"),
+                }
+                for item in inactive_dependencies
+                if isinstance(item, dict)
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
     zoom_controls, _ = st.columns((2, 5))
     with zoom_controls:
         diagram_zoom = _remembered_slider("Graph zoom", 60, 160, 100, "wave_graph_zoom")
@@ -345,13 +386,24 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
         height=diagram_height,
     )
 
-    wave_vm_uuids = set(selected_wave["server_vm_uuids"])
-    wave_connections = [
-        connection
-        for connection in connections
-        if connection.get("source_vm_uuid") in wave_vm_uuids
-    ]
-    with st.expander(f"Observed connections for {selected_wave_label} ({len(wave_connections)})"):
+    page_state_key = f"wave_connection_page_{selected_collector_id}_{selected_wave['wave']}"
+    st.session_state.setdefault(page_state_key, 1)
+    try:
+        wave_connection_page = client.wave_connections(
+            selected_collector_id,
+            list(selected_wave["server_vm_uuids"]),
+            observed_after.isoformat(),
+            observed_before.isoformat(),
+            st.session_state[page_state_key],
+        )
+    except DashboardClientError as error:
+        st.error(str(error))
+        return
+    wave_connections = wave_connection_page["items"]
+    total_connections = wave_connection_page["total"]
+    current_page = wave_connection_page["page"]
+    page_size = wave_connection_page["page_size"]
+    with st.expander(f"Observed connections for {selected_wave_label} ({total_connections})"):
         if wave_connections:
             display_connections = [
                 {
@@ -370,6 +422,22 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
                 for connection in wave_connections
             ]
             st.dataframe(display_connections, use_container_width=True, hide_index=True)
+            total_pages = max(1, (total_connections + page_size - 1) // page_size)
+            if total_pages > 1:
+                previous, page_label, next_page = st.columns((1, 3, 1))
+                with previous:
+                    if st.button("Previous", key=f"wave_previous_{page_state_key}"):
+                        st.session_state[page_state_key] = max(1, current_page - 1)
+                        st.rerun()
+                with page_label:
+                    st.caption(
+                        f"Page {current_page} of {total_pages}; "
+                        f"showing up to {page_size} observations per page."
+                    )
+                with next_page:
+                    if st.button("Next", key=f"wave_next_{page_state_key}"):
+                        st.session_state[page_state_key] = min(total_pages, current_page + 1)
+                        st.rerun()
         else:
             st.info("No observations were recorded for this wave in the selected time range.")
 

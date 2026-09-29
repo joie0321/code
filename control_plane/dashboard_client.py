@@ -44,6 +44,35 @@ class ControlPlaneDashboardClient:
             raise DashboardClientError("Control plane returned an invalid connection response")
         return response
 
+    def wave_connections(
+        self,
+        collector_id: str,
+        vm_uuids: list[str],
+        observed_after: str,
+        observed_before: str,
+        page: int,
+        page_size: int = 100,
+    ) -> dict[str, Any]:
+        response = self._get(
+            self._with_query(
+                f"/api/v1/dashboard/collectors/{collector_id}/wave-connections",
+                {
+                    "vm_uuid": vm_uuids,
+                    "observed_after": observed_after,
+                    "observed_before": observed_before,
+                    "page": page,
+                    "page_size": page_size,
+                },
+            )
+        )
+        if (
+            not isinstance(response, dict)
+            or not isinstance(response.get("items"), list)
+            or not isinstance(response.get("total"), int)
+        ):
+            raise DashboardClientError("Control plane returned an invalid wave connection response")
+        return response
+
     def detailed_connections(
         self, collector_id: str, observed_after: str, observed_before: str
     ) -> list[dict[str, Any]]:
@@ -149,5 +178,5 @@ class ControlPlaneDashboardClient:
             raise DashboardClientError("Control-plane dashboard request failed") from error
 
     @staticmethod
-    def _with_query(path: str, values: dict[str, str]) -> str:
-        return f"{path}?{urlencode(values)}"
+    def _with_query(path: str, values: dict[str, Any]) -> str:
+        return f"{path}?{urlencode(values, doseq=True)}"

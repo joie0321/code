@@ -14,12 +14,13 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from control_plane.config import ControlPlaneSettings
-from control_plane.db import Base, build_engine, build_session_factory, upgrade_schema
+from control_plane.db import build_engine, build_session_factory, run_migrations
 from control_plane.models import (
     Collector,
     Enrollment,
     InventoryBatch,
     InventoryVm,
+    InventoryVmState,
     Observation,
     ObservationBatch,
     ReconnectionCode,
@@ -28,6 +29,7 @@ from control_plane.reporting import (
     connection_report,
     detailed_connection_report,
     migration_waves,
+    wave_connection_report,
     wave_summary,
 )
 from control_plane.schemas import (
@@ -80,8 +82,7 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
     configured = settings or ControlPlaneSettings()
     configured.validate_runtime()
     engine = build_engine(configured.database_url_for_engine())
-    Base.metadata.create_all(engine)
-    upgrade_schema(engine)
+    run_migrations(engine)
     sessions = build_session_factory(engine)
 
     app = FastAPI(title="Migration Discovery Control Plane", version="0.1.0")
@@ -396,8 +397,22 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
                 InventoryVm.is_active.is_(True),
             )
         ).all()
+        present_vm_uuids = {item.vm_uuid for item in payload.vms}
         for vm in active_vms:
             vm.is_active = False
+            if vm.vm_uuid not in present_vm_uuids:
+                session.add(
+                    InventoryVmState(
+                        id=str(uuid4()),
+                        collector_id=collector.id,
+                        vm_uuid=vm.vm_uuid,
+                        name=vm.name,
+                        ips=vm.ips,
+                        power_state=vm.power_state,
+                        is_active=False,
+                        captured_at=now,
+                    )
+                )
         for item in payload.vms:
             vm = session.scalar(
                 select(InventoryVm).where(
@@ -417,6 +432,18 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             vm.power_state = item.power_state
             vm.is_active = True
             vm.updated_at = now
+            session.add(
+                InventoryVmState(
+                    id=str(uuid4()),
+                    collector_id=collector.id,
+                    vm_uuid=vm.vm_uuid,
+                    name=vm.name,
+                    ips=vm.ips,
+                    power_state=vm.power_state,
+                    is_active=True,
+                    captured_at=now,
+                )
+            )
         session.add(
             InventoryBatch(
                 id=str(uuid4()),
@@ -505,6 +532,30 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
     ) -> list[dict[str, object]]:
         _require_collector(collector_id, session)
         return connection_report(session, collector_id, observed_after, observed_before, limit)
+
+    @app.get(
+        "/api/v1/dashboard/collectors/{collector_id}/wave-connections",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def collector_wave_connections(
+        collector_id: str,
+        vm_uuid: list[str] = Query(min_length=1, max_length=250),
+        session: Session = Depends(get_session),
+        observed_after: datetime | None = None,
+        observed_before: datetime | None = None,
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=100, ge=1, le=250),
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        return wave_connection_report(
+            session,
+            collector_id,
+            vm_uuid,
+            observed_after,
+            observed_before,
+            page,
+            page_size,
+        )
 
     @app.get(
         "/api/v1/dashboard/collectors/{collector_id}/detailed-connections",
