@@ -73,6 +73,41 @@ class ControlPlaneDashboardClient:
             raise DashboardClientError("Control plane returned an invalid wave connection response")
         return response
 
+    def dependencies(
+        self, collector_id: str, observed_after: str, observed_before: str
+    ) -> dict[str, Any]:
+        response = self._get(
+            self._with_query(
+                f"/api/v1/dashboard/collectors/{collector_id}/dependencies",
+                {"observed_after": observed_after, "observed_before": observed_before},
+            )
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("items"), list):
+            raise DashboardClientError("Control plane returned an invalid dependency response")
+        return response
+
+    def save_dependency_decision(self, collector_id: str, payload: dict[str, str]) -> dict[str, Any]:
+        response = self._put(
+            f"/api/v1/dashboard/collectors/{collector_id}/dependency-decisions",
+            payload,
+            self._dashboard_key,
+        )
+        if not isinstance(response, dict) or response.get("status") != "saved":
+            raise DashboardClientError("Control plane returned an invalid dependency decision response")
+        return response
+
+    def save_dependency_decisions(
+        self, collector_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        response = self._put(
+            f"/api/v1/dashboard/collectors/{collector_id}/dependency-decisions/batch",
+            payload,
+            self._dashboard_key,
+        )
+        if not isinstance(response, dict) or response.get("status") != "saved":
+            raise DashboardClientError("Control plane returned an invalid dependency decision response")
+        return response
+
     def detailed_connections(
         self, collector_id: str, observed_after: str, observed_before: str
     ) -> list[dict[str, Any]]:
@@ -87,29 +122,149 @@ class ControlPlaneDashboardClient:
         return response
 
     def waves(
-        self, collector_id: str, observed_after: str, observed_before: str
+        self,
+        collector_id: str,
+        observed_after: str,
+        observed_before: str,
+        use_approved_plan: bool = True,
     ) -> list[dict[str, Any]]:
         response = self._get(
             self._with_query(
                 f"/api/v1/dashboard/collectors/{collector_id}/waves",
-                {"observed_after": observed_after, "observed_before": observed_before},
+                {
+                    "observed_after": observed_after,
+                    "observed_before": observed_before,
+                    "use_approved_plan": use_approved_plan,
+                },
             )
         )
         if not isinstance(response, list):
             raise DashboardClientError("Control plane returned an invalid wave response")
         return response
 
+    def migration_plans(self, collector_id: str) -> list[dict[str, Any]]:
+        response = self._get(f"/api/v1/dashboard/collectors/{collector_id}/migration-plans")
+        if not isinstance(response, list):
+            raise DashboardClientError("Control plane returned an invalid migration plan response")
+        return response
+
+    def plan_drift(self, collector_id: str) -> dict[str, Any]:
+        response = self._get(f"/api/v1/dashboard/collectors/{collector_id}/plan-drift")
+        if not isinstance(response, dict) or not isinstance(response.get("items"), list):
+            raise DashboardClientError("Control plane returned an invalid plan drift response")
+        return response
+
+    def migration_plan(self, collector_id: str, plan_id: str) -> dict[str, Any]:
+        response = self._get(
+            f"/api/v1/dashboard/collectors/{collector_id}/migration-plans/{quote(plan_id, safe='')}"
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("assignments"), list):
+            raise DashboardClientError("Control plane returned an invalid migration plan detail")
+        return response
+
+    def create_migration_plan(
+        self, collector_id: str, payload: dict[str, str], observed_after: str, observed_before: str
+    ) -> dict[str, Any]:
+        response = self._post(
+            self._with_query(
+                f"/api/v1/dashboard/collectors/{collector_id}/migration-plans",
+                {"observed_after": observed_after, "observed_before": observed_before},
+            ),
+            payload,
+            self._dashboard_key,
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("plan_id"), str):
+            raise DashboardClientError("Control plane returned an invalid new migration plan")
+        return response
+
+    def clone_migration_plan(
+        self, collector_id: str, plan_id: str, payload: dict[str, str]
+    ) -> dict[str, Any]:
+        response = self._post(
+            f"/api/v1/dashboard/collectors/{collector_id}/migration-plans/{quote(plan_id, safe='')}/versions",
+            payload,
+            self._dashboard_key,
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("plan_id"), str):
+            raise DashboardClientError("Control plane returned an invalid migration plan version")
+        return response
+
+    def update_migration_plan_assignment(
+        self, collector_id: str, plan_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        response = self._put(
+            f"/api/v1/dashboard/collectors/{collector_id}/migration-plans/{quote(plan_id, safe='')}/assignments",
+            payload,
+            self._dashboard_key,
+        )
+        if not isinstance(response, dict) or response.get("status") != "saved":
+            raise DashboardClientError("Control plane returned an invalid migration plan update")
+        return response
+
+    def update_migration_plan_assignments(
+        self, collector_id: str, plan_id: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        response = self._put(
+            f"/api/v1/dashboard/collectors/{collector_id}/migration-plans/{quote(plan_id, safe='')}/bulk-assignments",
+            payload,
+            self._dashboard_key,
+        )
+        if not isinstance(response, dict) or response.get("status") != "saved":
+            raise DashboardClientError("Control plane returned an invalid migration plan bulk update")
+        return response
+
+    def approve_migration_plan(
+        self, collector_id: str, plan_id: str, payload: dict[str, str]
+    ) -> dict[str, Any]:
+        response = self._post(
+            f"/api/v1/dashboard/collectors/{collector_id}/migration-plans/{quote(plan_id, safe='')}/approve",
+            payload,
+            self._dashboard_key,
+        )
+        if not isinstance(response, dict) or response.get("status") != "approved":
+            raise DashboardClientError("Control plane returned an invalid migration plan approval")
+        return response
+
     def wave_summary(
-        self, collector_id: str, observed_after: str, observed_before: str
+        self,
+        collector_id: str,
+        observed_after: str,
+        observed_before: str,
+        use_approved_plan: bool = True,
     ) -> dict[str, Any]:
         response = self._get(
             self._with_query(
                 f"/api/v1/dashboard/collectors/{collector_id}/wave-summary",
-                {"observed_after": observed_after, "observed_before": observed_before},
+                {
+                    "observed_after": observed_after,
+                    "observed_before": observed_before,
+                    "use_approved_plan": use_approved_plan,
+                },
             )
         )
         if not isinstance(response, dict):
             raise DashboardClientError("Control plane returned an invalid wave summary response")
+        return response
+
+    def wave_readiness(
+        self,
+        collector_id: str,
+        observed_after: str,
+        observed_before: str,
+        use_approved_plan: bool = True,
+    ) -> dict[str, Any]:
+        response = self._get(
+            self._with_query(
+                f"/api/v1/dashboard/collectors/{collector_id}/wave-readiness",
+                {
+                    "observed_after": observed_after,
+                    "observed_before": observed_before,
+                    "use_approved_plan": use_approved_plan,
+                },
+            )
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("waves"), list):
+            raise DashboardClientError("Control plane returned an invalid wave readiness response")
         return response
 
     def create_enrollment(self, tenant_id: str, expires_in_minutes: int) -> dict[str, Any]:
@@ -166,6 +321,15 @@ class ControlPlaneDashboardClient:
             f"{self._base_url}{path}",
             headers={"X-Control-Plane-Key": key},
             method="DELETE",
+        )
+        return self._read_response(request)
+
+    def _put(self, path: str, payload: dict[str, str], key: str) -> Any:
+        request = Request(
+            f"{self._base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "X-Control-Plane-Key": key},
+            method="PUT",
         )
         return self._read_response(request)
 

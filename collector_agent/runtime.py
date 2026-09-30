@@ -742,6 +742,17 @@ class AgentRuntime:
                             self.sync_aws_flow_logs(profile.identity.collector_id)
                         except (ControlPlaneClientError, ValueError):
                             pass
+                    should_sync_inventory = (
+                        profile.last_inventory_sync_at is None
+                        or datetime.now(UTC) - profile.last_inventory_sync_at
+                        >= timedelta(seconds=self._settings.inventory_sync_interval_seconds)
+                    )
+                    if should_sync_inventory:
+                        try:
+                            self.sync_inventory(profile.identity.collector_id)
+                        except (ControlPlaneClientError, ValueError):
+                            # Keep the last successful inventory and retry after the next heartbeat.
+                            pass
                 except ControlPlaneClientError:
                     self._set_error(
                         profile.identity.collector_id,

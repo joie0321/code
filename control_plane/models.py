@@ -127,3 +127,89 @@ class InventoryVmState(Base):
     power_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, index=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class DependencyDecision(Base):
+    """Planner decision for one normalized dependency-review relationship."""
+
+    __tablename__ = "dependency_decisions"
+    __table_args__ = (
+        UniqueConstraint(
+            "collector_id",
+            "source_vm_uuid",
+            "destination_identity",
+            "protocol",
+            "port_key",
+            "category",
+            name="uq_dependency_decision",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    collector_id: Mapped[str] = mapped_column(ForeignKey("collectors.id"), index=True)
+    source_vm_uuid: Mapped[str] = mapped_column(String(64), index=True)
+    destination_identity: Mapped[str] = mapped_column(String(64), index=True)
+    protocol: Mapped[str] = mapped_column(String(8))
+    port_key: Mapped[str] = mapped_column(String(32))
+    category: Mapped[str] = mapped_column(String(64))
+    decision: Mapped[str] = mapped_column(String(32))
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class MigrationPlan(Base):
+    """A versioned, planner-owned migration plan for one collector."""
+
+    __tablename__ = "migration_plans"
+    __table_args__ = (UniqueConstraint("collector_id", "version", name="uq_migration_plan_version"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    collector_id: Mapped[str] = mapped_column(ForeignKey("collectors.id"), index=True)
+    version: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
+    planner_name: Mapped[str] = mapped_column(String(128))
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MigrationPlanVm(Base):
+    """One VM assignment frozen into a versioned migration plan."""
+
+    __tablename__ = "migration_plan_vms"
+    __table_args__ = (UniqueConstraint("plan_id", "vm_uuid", name="uq_migration_plan_vm"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("migration_plans.id"), index=True)
+    vm_uuid: Mapped[str] = mapped_column(String(64), index=True)
+    vm_name: Mapped[str] = mapped_column(String(255))
+    recommended_wave_number: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    wave_number: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    disposition: Mapped[str] = mapped_column(String(16), default="included", index=True)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class MigrationPlanDependency(Base):
+    """Normalized dependency evidence frozen when a migration plan is approved."""
+
+    __tablename__ = "migration_plan_dependencies"
+    __table_args__ = (
+        UniqueConstraint(
+            "plan_id",
+            "source_vm_uuid",
+            "destination_identity",
+            "protocol",
+            "port_key",
+            "category",
+            name="uq_migration_plan_dependency",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    plan_id: Mapped[str] = mapped_column(ForeignKey("migration_plans.id"), index=True)
+    source_vm_uuid: Mapped[str] = mapped_column(String(64), index=True)
+    destination_identity: Mapped[str] = mapped_column(String(64), index=True)
+    protocol: Mapped[str] = mapped_column(String(8))
+    port_key: Mapped[str] = mapped_column(String(32))
+    category: Mapped[str] = mapped_column(String(64))

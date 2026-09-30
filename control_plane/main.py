@@ -9,6 +9,7 @@ from secrets import token_urlsafe
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, status
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -17,19 +18,27 @@ from control_plane.config import ControlPlaneSettings
 from control_plane.db import build_engine, build_session_factory, run_migrations
 from control_plane.models import (
     Collector,
+    DependencyDecision,
     Enrollment,
     InventoryBatch,
     InventoryVm,
     InventoryVmState,
+    MigrationPlan,
+    MigrationPlanDependency,
+    MigrationPlanVm,
     Observation,
     ObservationBatch,
     ReconnectionCode,
 )
 from control_plane.reporting import (
     connection_report,
+    dependency_review_report,
     detailed_connection_report,
     migration_waves,
+    plan_dependency_report,
+    plan_drift_report,
     wave_connection_report,
+    wave_readiness_report,
     wave_summary,
 )
 from control_plane.schemas import (
@@ -47,6 +56,56 @@ from control_plane.schemas import (
 )
 
 _COLLECTOR_OFFLINE_AFTER_SECONDS = 180
+
+
+class DependencyDecisionPayload(BaseModel):
+    source_vm_uuid: str = Field(min_length=1, max_length=64)
+    destination_identity: str = Field(min_length=1, max_length=64)
+    protocol: str = Field(min_length=1, max_length=8)
+    port_key: str = Field(min_length=1, max_length=32)
+    category: str = Field(min_length=1, max_length=64)
+    decision: str = Field(min_length=1, max_length=32)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class DependencyDecisionReference(BaseModel):
+    """A normalized dependency identity selected for a common planner decision."""
+
+    source_vm_uuid: str = Field(min_length=1, max_length=64)
+    destination_identity: str = Field(min_length=1, max_length=64)
+    protocol: str = Field(min_length=1, max_length=8)
+    port_key: str = Field(min_length=1, max_length=32)
+    category: str = Field(min_length=1, max_length=64)
+
+
+class DependencyDecisionBatchPayload(BaseModel):
+    dependencies: list[DependencyDecisionReference] = Field(min_length=1, max_length=250)
+    decision: str = Field(min_length=1, max_length=32)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class MigrationPlanCreatePayload(BaseModel):
+    planner_name: str = Field(min_length=1, max_length=128)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class MigrationPlanAssignmentPayload(BaseModel):
+    vm_uuid: str = Field(min_length=1, max_length=64)
+    wave_number: int | None = Field(default=None, ge=1, le=10_000)
+    disposition: str = Field(min_length=1, max_length=16)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class MigrationPlanBulkAssignmentPayload(BaseModel):
+    vm_uuids: list[str] = Field(min_length=1, max_length=250)
+    wave_number: int | None = Field(default=None, ge=1, le=10_000)
+    disposition: str = Field(min_length=1, max_length=16)
+    note: str | None = Field(default=None, max_length=2000)
+
+
+class MigrationPlanApprovalPayload(BaseModel):
+    planner_name: str = Field(min_length=1, max_length=128)
+    note: str | None = Field(default=None, max_length=2000)
 
 
 def _digest(value: str) -> str:
@@ -224,7 +283,28 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         if collector is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
         try:
+            plan_ids = select(MigrationPlan.id).where(MigrationPlan.collector_id == collector_id)
             deleted = {
+                "migration_plan_dependencies": session.execute(
+                    delete(MigrationPlanDependency).where(MigrationPlanDependency.plan_id.in_(plan_ids))
+                ).rowcount
+                or 0,
+                "migration_plan_vms": session.execute(
+                    delete(MigrationPlanVm).where(MigrationPlanVm.plan_id.in_(plan_ids))
+                ).rowcount
+                or 0,
+                "migration_plans": session.execute(
+                    delete(MigrationPlan).where(MigrationPlan.collector_id == collector_id)
+                ).rowcount
+                or 0,
+                "dependency_decisions": session.execute(
+                    delete(DependencyDecision).where(DependencyDecision.collector_id == collector_id)
+                ).rowcount
+                or 0,
+                "inventory_vm_states": session.execute(
+                    delete(InventoryVmState).where(InventoryVmState.collector_id == collector_id)
+                ).rowcount
+                or 0,
                 "observations": session.execute(
                     delete(Observation).where(Observation.collector_id == collector_id)
                 ).rowcount
@@ -558,6 +638,562 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         )
 
     @app.get(
+        "/api/v1/dashboard/collectors/{collector_id}/wave-readiness",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def collector_wave_readiness(
+        collector_id: str,
+        session: Session = Depends(get_session),
+        observed_after: datetime | None = None,
+        observed_before: datetime | None = None,
+        use_approved_plan: bool = True,
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        return wave_readiness_report(
+            session,
+            collector_id,
+            observed_after,
+            observed_before,
+            use_approved_plan=use_approved_plan,
+        )
+
+    @app.get("/api/v1/dashboard/collectors/{collector_id}/plan-drift", dependencies=[Depends(require_dashboard)])
+    def collector_plan_drift(collector_id: str, session: Session = Depends(get_session)) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        return plan_drift_report(session, collector_id)
+
+    @app.get(
+        "/api/v1/dashboard/collectors/{collector_id}/dependencies",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def collector_dependencies(
+        collector_id: str,
+        session: Session = Depends(get_session),
+        observed_after: datetime | None = None,
+        observed_before: datetime | None = None,
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        report = dependency_review_report(session, collector_id, observed_after, observed_before)
+        decisions = session.scalars(
+            select(DependencyDecision).where(DependencyDecision.collector_id == collector_id)
+        ).all()
+        decisions_by_key = {
+            (
+                decision.source_vm_uuid,
+                decision.destination_identity,
+                decision.protocol,
+                decision.port_key,
+                decision.category,
+            ): decision
+            for decision in decisions
+        }
+        for item in report["items"]:
+            decision = decisions_by_key.get(
+                (
+                    str(item["source_vm_uuid"]),
+                    str(item["destination_identity"]),
+                    str(item["protocol"]).casefold(),
+                    str(item["port_key"]),
+                    str(item["category"]),
+                )
+            )
+            item["planner_decision"] = decision.decision if decision else None
+            item["planner_note"] = decision.note if decision else None
+        return report
+
+    @app.put(
+        "/api/v1/dashboard/collectors/{collector_id}/dependency-decisions",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def save_dependency_decision(
+        collector_id: str,
+        payload: DependencyDecisionPayload,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        allowed_decisions = {
+            "Confirmed hard dependency",
+            "Soft dependency",
+            "Confirmed shared service",
+            "External dependency accepted",
+            "Not relevant / excluded",
+            "Requires action before cutover",
+            "Network/firewall action required",
+            "DNS/routing action required",
+            "Owner validation required",
+            "Target service setup required",
+            "Investigate before cutover",
+            "Requires hybrid plan",
+        }
+        if payload.decision not in allowed_decisions:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="invalid decision",
+            )
+        if payload.decision in {"Confirmed hard dependency", "Not relevant / excluded"} and not (
+            payload.note and payload.note.strip()
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="a planner note is required for this decision",
+            )
+        matching_items = dependency_review_report(session, collector_id)["items"]
+        exists = any(
+            item["source_vm_uuid"] == payload.source_vm_uuid
+            and item["destination_identity"] == payload.destination_identity
+            and str(item["protocol"]).casefold() == payload.protocol.casefold()
+            and item["port_key"] == payload.port_key
+            and item["category"] == payload.category
+            for item in matching_items
+        )
+        if not exists:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unknown dependency")
+        decision = session.scalar(
+            select(DependencyDecision).where(
+                DependencyDecision.collector_id == collector_id,
+                DependencyDecision.source_vm_uuid == payload.source_vm_uuid,
+                DependencyDecision.destination_identity == payload.destination_identity,
+                DependencyDecision.protocol == payload.protocol.casefold(),
+                DependencyDecision.port_key == payload.port_key,
+                DependencyDecision.category == payload.category,
+            )
+        )
+        if decision is None:
+            decision = DependencyDecision(id=str(uuid4()), collector_id=collector_id)
+            session.add(decision)
+        decision.source_vm_uuid = payload.source_vm_uuid
+        decision.destination_identity = payload.destination_identity
+        decision.protocol = payload.protocol.casefold()
+        decision.port_key = payload.port_key
+        decision.category = payload.category
+        decision.decision = payload.decision
+        decision.note = payload.note.strip() if payload.note and payload.note.strip() else None
+        decision.updated_at = _now()
+        session.commit()
+        return {"status": "saved", "decision": decision.decision}
+
+    @app.put(
+        "/api/v1/dashboard/collectors/{collector_id}/dependency-decisions/batch",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def save_dependency_decisions(
+        collector_id: str,
+        payload: DependencyDecisionBatchPayload,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        """Apply one reviewed decision and note to a bounded set of known dependencies."""
+
+        _require_collector(collector_id, session)
+        allowed_decisions = {
+            "Confirmed hard dependency",
+            "Soft dependency",
+            "Confirmed shared service",
+            "External dependency accepted",
+            "Not relevant / excluded",
+            "Requires action before cutover",
+            "Network/firewall action required",
+            "DNS/routing action required",
+            "Owner validation required",
+            "Target service setup required",
+            "Investigate before cutover",
+            "Requires hybrid plan",
+        }
+        if payload.decision not in allowed_decisions:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid decision")
+        note = payload.note.strip() if payload.note and payload.note.strip() else None
+        if payload.decision in {"Confirmed hard dependency", "Not relevant / excluded"} and not note:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="a planner note is required for this decision",
+            )
+
+        dependency_keys = [
+            (
+                dependency.source_vm_uuid,
+                dependency.destination_identity,
+                dependency.protocol.casefold(),
+                dependency.port_key,
+                dependency.category,
+            )
+            for dependency in payload.dependencies
+        ]
+        if len(set(dependency_keys)) != len(dependency_keys):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="duplicate dependency selection",
+            )
+        available_keys = {
+            (
+                str(item["source_vm_uuid"]),
+                str(item["destination_identity"]),
+                str(item["protocol"]).casefold(),
+                str(item["port_key"]),
+                str(item["category"]),
+            )
+            for item in dependency_review_report(session, collector_id)["items"]
+        }
+        if not set(dependency_keys).issubset(available_keys):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="unknown dependency",
+            )
+
+        existing_decisions = session.scalars(
+            select(DependencyDecision).where(DependencyDecision.collector_id == collector_id)
+        ).all()
+        decisions_by_key = {
+            (
+                decision.source_vm_uuid,
+                decision.destination_identity,
+                decision.protocol,
+                decision.port_key,
+                decision.category,
+            ): decision
+            for decision in existing_decisions
+        }
+        for source_vm_uuid, destination_identity, protocol, port_key, category in dependency_keys:
+            decision = decisions_by_key.get(
+                (source_vm_uuid, destination_identity, protocol, port_key, category)
+            )
+            if decision is None:
+                decision = DependencyDecision(id=str(uuid4()), collector_id=collector_id)
+                session.add(decision)
+            decision.source_vm_uuid = source_vm_uuid
+            decision.destination_identity = destination_identity
+            decision.protocol = protocol
+            decision.port_key = port_key
+            decision.category = category
+            decision.decision = payload.decision
+            decision.note = note
+            decision.updated_at = _now()
+        session.commit()
+        return {
+            "status": "saved",
+            "count": len(dependency_keys),
+            "decision": payload.decision,
+        }
+
+    def _plan_response(plan: MigrationPlan, assignments: list[MigrationPlanVm]) -> dict[str, object]:
+        """Serialize plan data without exposing collector credentials or tokens."""
+
+        return {
+            "plan_id": plan.id,
+            "collector_id": plan.collector_id,
+            "version": plan.version,
+            "status": plan.status,
+            "planner_name": plan.planner_name,
+            "note": plan.note,
+            "created_at": plan.created_at,
+            "updated_at": plan.updated_at,
+            "approved_at": plan.approved_at,
+            "assignments": [
+                {
+                    "vm_uuid": assignment.vm_uuid,
+                    "vm_name": assignment.vm_name,
+                    "recommended_wave_number": assignment.recommended_wave_number,
+                    "wave_number": assignment.wave_number,
+                    "disposition": assignment.disposition,
+                    "note": assignment.note,
+                }
+                for assignment in assignments
+            ],
+        }
+
+    def _get_plan(collector_id: str, plan_id: str, session: Session) -> MigrationPlan:
+        plan = session.get(MigrationPlan, plan_id)
+        if plan is None or plan.collector_id != collector_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="migration plan not found")
+        return plan
+
+    @app.get(
+        "/api/v1/dashboard/collectors/{collector_id}/migration-plans",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def list_migration_plans(
+        collector_id: str,
+        session: Session = Depends(get_session),
+    ) -> list[dict[str, object]]:
+        _require_collector(collector_id, session)
+        plans = session.scalars(
+            select(MigrationPlan)
+            .where(MigrationPlan.collector_id == collector_id)
+            .order_by(MigrationPlan.version.desc())
+        ).all()
+        return [
+            {
+                "plan_id": plan.id,
+                "version": plan.version,
+                "status": plan.status,
+                "planner_name": plan.planner_name,
+                "note": plan.note,
+                "created_at": plan.created_at,
+                "updated_at": plan.updated_at,
+                "approved_at": plan.approved_at,
+            }
+            for plan in plans
+        ]
+
+    @app.get(
+        "/api/v1/dashboard/collectors/{collector_id}/migration-plans/{plan_id}",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def get_migration_plan(
+        collector_id: str,
+        plan_id: str,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        plan = _get_plan(collector_id, plan_id, session)
+        assignments = session.scalars(
+            select(MigrationPlanVm)
+            .where(MigrationPlanVm.plan_id == plan.id)
+            .order_by(MigrationPlanVm.disposition, MigrationPlanVm.wave_number, MigrationPlanVm.vm_name)
+        ).all()
+        return _plan_response(plan, assignments)
+
+    @app.post(
+        "/api/v1/dashboard/collectors/{collector_id}/migration-plans",
+        dependencies=[Depends(require_dashboard)],
+        status_code=status.HTTP_201_CREATED,
+    )
+    def create_migration_plan(
+        collector_id: str,
+        payload: MigrationPlanCreatePayload,
+        session: Session = Depends(get_session),
+        observed_after: datetime | None = None,
+        observed_before: datetime | None = None,
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        if session.scalar(
+            select(MigrationPlan.id).where(
+                MigrationPlan.collector_id == collector_id, MigrationPlan.status == "draft"
+            )
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="finish or approve the existing draft before creating another plan version",
+            )
+        recommended_waves = migration_waves(
+            session, collector_id, observed_after, observed_before, use_approved_plan=False
+        )
+        if not recommended_waves:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="no eligible powered-on VMs are available for a migration plan",
+            )
+        current_version = session.scalar(
+            select(func.max(MigrationPlan.version)).where(MigrationPlan.collector_id == collector_id)
+        )
+        now = _now()
+        plan = MigrationPlan(
+            id=str(uuid4()),
+            collector_id=collector_id,
+            version=(current_version or 0) + 1,
+            status="draft",
+            planner_name=payload.planner_name.strip(),
+            note=payload.note.strip() if payload.note and payload.note.strip() else None,
+            created_at=now,
+            updated_at=now,
+        )
+        assignments: list[MigrationPlanVm] = []
+        for wave in recommended_waves:
+            for vm_uuid, vm_name in zip(
+                wave["server_vm_uuids"], wave["server_names"], strict=True
+            ):
+                assignments.append(
+                    MigrationPlanVm(
+                        id=str(uuid4()),
+                        plan_id=plan.id,
+                        vm_uuid=str(vm_uuid),
+                        vm_name=str(vm_name),
+                        recommended_wave_number=int(wave["wave"]),
+                        wave_number=int(wave["wave"]),
+                        disposition="included",
+                    )
+                )
+        session.add(plan)
+        session.add_all(assignments)
+        session.commit()
+        return _plan_response(plan, assignments)
+
+    @app.post(
+        "/api/v1/dashboard/collectors/{collector_id}/migration-plans/{plan_id}/versions",
+        dependencies=[Depends(require_dashboard)],
+        status_code=status.HTTP_201_CREATED,
+    )
+    def clone_migration_plan(
+        collector_id: str,
+        plan_id: str,
+        payload: MigrationPlanCreatePayload,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        source = _get_plan(collector_id, plan_id, session)
+        if source.status != "approved":
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="only an approved plan can be used as the baseline for a new version",
+            )
+        if session.scalar(
+            select(MigrationPlan.id).where(
+                MigrationPlan.collector_id == collector_id, MigrationPlan.status == "draft"
+            )
+        ):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="a draft plan already exists")
+        source_assignments = session.scalars(
+            select(MigrationPlanVm).where(MigrationPlanVm.plan_id == source.id)
+        ).all()
+        current_version = session.scalar(
+            select(func.max(MigrationPlan.version)).where(MigrationPlan.collector_id == collector_id)
+        )
+        now = _now()
+        plan = MigrationPlan(
+            id=str(uuid4()), collector_id=collector_id, version=(current_version or 0) + 1,
+            status="draft", planner_name=payload.planner_name.strip(),
+            note=payload.note.strip() if payload.note and payload.note.strip() else None,
+            created_at=now, updated_at=now,
+        )
+        assignments = [
+            MigrationPlanVm(
+                id=str(uuid4()), plan_id=plan.id, vm_uuid=item.vm_uuid, vm_name=item.vm_name,
+                recommended_wave_number=item.recommended_wave_number,
+                wave_number=item.wave_number, disposition=item.disposition, note=item.note,
+            )
+            for item in source_assignments
+        ]
+        session.add(plan)
+        session.add_all(assignments)
+        session.commit()
+        return _plan_response(plan, assignments)
+
+    @app.put(
+        "/api/v1/dashboard/collectors/{collector_id}/migration-plans/{plan_id}/assignments",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def update_migration_plan_assignment(
+        collector_id: str,
+        plan_id: str,
+        payload: MigrationPlanAssignmentPayload,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        plan = _get_plan(collector_id, plan_id, session)
+        if plan.status != "draft":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="approved plans are read-only")
+        if payload.disposition not in {"included", "excluded"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid disposition")
+        if payload.disposition == "included" and payload.wave_number is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="included VMs need a wave number")
+        assignment = session.scalar(
+            select(MigrationPlanVm).where(
+                MigrationPlanVm.plan_id == plan.id, MigrationPlanVm.vm_uuid == payload.vm_uuid
+            )
+        )
+        if assignment is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="VM is not in this plan")
+        assignment.disposition = payload.disposition
+        assignment.wave_number = payload.wave_number if payload.disposition == "included" else None
+        assignment.note = payload.note.strip() if payload.note and payload.note.strip() else None
+        plan.updated_at = _now()
+        session.commit()
+        return {"status": "saved", "plan_id": plan.id, "vm_uuid": assignment.vm_uuid}
+
+    @app.put(
+        "/api/v1/dashboard/collectors/{collector_id}/migration-plans/{plan_id}/bulk-assignments",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def update_migration_plan_assignments(
+        collector_id: str,
+        plan_id: str,
+        payload: MigrationPlanBulkAssignmentPayload,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        plan = _get_plan(collector_id, plan_id, session)
+        if plan.status != "draft":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="approved plans are read-only")
+        if payload.disposition not in {"included", "excluded"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid disposition")
+        if payload.disposition == "included" and payload.wave_number is None:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="included VMs need a wave number")
+        unique_vm_uuids = set(payload.vm_uuids)
+        if len(unique_vm_uuids) != len(payload.vm_uuids):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="duplicate VM selection")
+        assignments = session.scalars(
+            select(MigrationPlanVm).where(
+                MigrationPlanVm.plan_id == plan.id, MigrationPlanVm.vm_uuid.in_(unique_vm_uuids)
+            )
+        ).all()
+        if len(assignments) != len(unique_vm_uuids):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="one or more VMs are not in this plan")
+        for assignment in assignments:
+            assignment.disposition = payload.disposition
+            assignment.wave_number = payload.wave_number if payload.disposition == "included" else None
+            assignment.note = payload.note.strip() if payload.note and payload.note.strip() else None
+        plan.updated_at = _now()
+        session.commit()
+        return {"status": "saved", "plan_id": plan.id, "vm_count": len(assignments)}
+
+    @app.post(
+        "/api/v1/dashboard/collectors/{collector_id}/migration-plans/{plan_id}/approve",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def approve_migration_plan(
+        collector_id: str,
+        plan_id: str,
+        payload: MigrationPlanApprovalPayload,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        plan = _get_plan(collector_id, plan_id, session)
+        if plan.status != "draft":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="only a draft plan can be approved")
+        included_count = session.scalar(
+            select(func.count(MigrationPlanVm.id)).where(
+                MigrationPlanVm.plan_id == plan.id, MigrationPlanVm.disposition == "included"
+            )
+        )
+        if not included_count:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="a plan needs at least one included VM")
+        now = _now()
+        session.execute(
+            update(MigrationPlan)
+            .where(MigrationPlan.collector_id == collector_id, MigrationPlan.status == "approved")
+            .values(status="superseded", updated_at=now)
+        )
+        plan.status = "approved"
+        plan.planner_name = payload.planner_name.strip()
+        plan.note = payload.note.strip() if payload.note and payload.note.strip() else plan.note
+        plan.approved_at = now
+        plan.updated_at = now
+        included_vm_uuids = {
+            assignment.vm_uuid
+            for assignment in session.scalars(
+                select(MigrationPlanVm).where(
+                    MigrationPlanVm.plan_id == plan.id,
+                    MigrationPlanVm.disposition == "included",
+                )
+            ).all()
+        }
+        baseline_dependencies = plan_dependency_report(session, collector_id)
+        session.add_all(
+            MigrationPlanDependency(
+                id=str(uuid4()),
+                plan_id=plan.id,
+                source_vm_uuid=str(item["source_vm_uuid"]),
+                destination_identity=str(item["destination_identity"]),
+                protocol=str(item["protocol"]).casefold(),
+                port_key=str(item["port_key"]),
+                category=str(item["category"]),
+            )
+            for item in baseline_dependencies
+            if str(item["source_vm_uuid"]) in included_vm_uuids
+            or str(item.get("destination_vm_uuid") or "") in included_vm_uuids
+        )
+        session.commit()
+        return {"status": "approved", "plan_id": plan.id, "version": plan.version}
+
+    @app.get(
         "/api/v1/dashboard/collectors/{collector_id}/detailed-connections",
         dependencies=[Depends(require_dashboard)],
     )
@@ -579,9 +1215,16 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         session: Session = Depends(get_session),
         observed_after: datetime | None = None,
         observed_before: datetime | None = None,
+        use_approved_plan: bool = True,
     ) -> list[dict[str, object]]:
         _require_collector(collector_id, session)
-        return migration_waves(session, collector_id, observed_after, observed_before)
+        return migration_waves(
+            session,
+            collector_id,
+            observed_after,
+            observed_before,
+            use_approved_plan=use_approved_plan,
+        )
 
     @app.get(
         "/api/v1/dashboard/collectors/{collector_id}/wave-summary",
@@ -592,8 +1235,15 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         session: Session = Depends(get_session),
         observed_after: datetime | None = None,
         observed_before: datetime | None = None,
+        use_approved_plan: bool = True,
     ) -> dict[str, int]:
         _require_collector(collector_id, session)
-        return wave_summary(session, collector_id, observed_after, observed_before)
+        return wave_summary(
+            session,
+            collector_id,
+            observed_after,
+            observed_before,
+            use_approved_plan=use_approved_plan,
+        )
 
     return app
