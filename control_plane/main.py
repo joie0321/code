@@ -625,6 +625,8 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         observed_before: datetime | None = None,
         page: int = Query(default=1, ge=1),
         page_size: int = Query(default=100, ge=1, le=250),
+        deduplicate: bool = False,
+        exclude_dynamic_private_ports: bool = False,
     ) -> dict[str, object]:
         _require_collector(collector_id, session)
         return wave_connection_report(
@@ -635,6 +637,8 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             observed_before,
             page,
             page_size,
+            deduplicate,
+            exclude_dynamic_private_ports,
         )
 
     @app.get(

@@ -18,6 +18,7 @@ _NAVIGATION_PAGES = (
     "Dependency Review",
     "Migration Plan",
 )
+_DASHBOARD_NAVIGATION_PAGES = ("Current Environment", *_NAVIGATION_PAGES)
 _PLANNER_DECISIONS_BY_CATEGORY = {
     "External dependency": (
         "Confirmed hard dependency",
@@ -62,6 +63,7 @@ try:  # Supports `streamlit run control_plane/dashboard.py` from the project roo
         build_migration_plan_pdf,
         plan_report_filename,
     )
+    from control_plane.reporting import dependency_readiness_status
 except ModuleNotFoundError:  # pragma: no cover - Streamlit executes the file as a script.
     from config import ControlPlaneSettings
     from dashboard_client import ControlPlaneDashboardClient, DashboardClientError
@@ -72,6 +74,7 @@ except ModuleNotFoundError:  # pragma: no cover - Streamlit executes the file as
         build_migration_plan_pdf,
         plan_report_filename,
     )
+    from reporting import dependency_readiness_status
 
 st.set_page_config(page_title="Migration Discovery Dashboard", page_icon="🧭", layout="wide")
 st.markdown(
@@ -129,6 +132,26 @@ def card(
         f"{value_html}</div>",
         unsafe_allow_html=True,
     )
+
+
+def _readiness_category(item: dict[str, object]) -> str:
+    """Place every wave in one mutually exclusive readiness state."""
+
+    risk = str(item.get("risk", ""))
+    confidence = str(item.get("confidence", ""))
+    if risk == "High":
+        return "High risk"
+    if risk == "Medium":
+        return "Needs review"
+    if risk == "Low" and confidence == "High":
+        return "Ready for approval"
+    return "Evidence needs refresh"
+
+
+def _not_reviewed_dependency_count(items: list[dict[str, object]]) -> int:
+    """Count review relationships without a saved planner decision."""
+
+    return sum(not item.get("planner_decision") for item in items)
 
 
 def _escape_dot(value: object) -> str:
@@ -255,13 +278,13 @@ def _remembered_slider(label: str, minimum: int, maximum: int, default: int, sta
     )
 
 
-def _observation_window() -> tuple[datetime, datetime, str]:
+def _observation_window(state_prefix: str = "wave") -> tuple[datetime, datetime, str]:
     """Return an inclusive UTC reporting window selected by the operator."""
 
     range_name = st.selectbox(
         "Observed connection time range",
         ("1 day", "5 days", "1 week", "1 month", "Custom time range"),
-        key="wave_time_range",
+        key=f"{state_prefix}_time_range",
     )
     now = datetime.now(UTC)
     durations = {
@@ -278,7 +301,7 @@ def _observation_window() -> tuple[datetime, datetime, str]:
         "Custom observed dates",
         value=(default_start, now.date()),
         max_value=now.date(),
-        key="wave_custom_dates",
+        key=f"{state_prefix}_custom_dates",
     )
     start = datetime.combine(start_date, time.min, tzinfo=UTC)
     end = datetime.combine(end_date, time.max, tzinfo=UTC)
@@ -385,6 +408,401 @@ def _wave_graph(
     return "\n".join(lines)
 
 
+def _connection_vm_uuids(connection: dict[str, object]) -> set[str]:
+    """Return current-inventory VM identifiers referenced by one observation."""
+
+    return {
+        str(vm_uuid)
+        for vm_uuid in (connection.get("source_vm_uuid"), connection.get("destination_vm_uuid"))
+        if isinstance(vm_uuid, str) and vm_uuid
+    }
+
+
+def _dependency_map_graph(
+    names_by_uuid: dict[str, str],
+    connections: list[dict[str, object]],
+    displayed_vm_uuids: set[str],
+    focus_vm_uuid: str | None = None,
+    zoom_percent: int = 100,
+) -> str:
+    """Build a compact discovery map with external endpoints collapsed to one node."""
+
+    node_ids = {
+        vm_uuid: f"vm_{index}"
+        for index, vm_uuid in enumerate(sorted(displayed_vm_uuids), start=1)
+    }
+    edge_ports: dict[tuple[str, str], set[str]] = {}
+    external_destinations: set[str] = set()
+    for connection in connections:
+        source_vm_uuid = connection.get("source_vm_uuid")
+        destination_vm_uuid = connection.get("destination_vm_uuid")
+        if not isinstance(source_vm_uuid, str) or source_vm_uuid not in node_ids:
+            continue
+        if isinstance(destination_vm_uuid, str) and destination_vm_uuid in node_ids:
+            destination_id = node_ids[destination_vm_uuid]
+        elif destination_vm_uuid:
+            continue
+        else:
+            destination_ip = str(connection.get("destination_ip", "Unknown"))
+            external_destinations.add(destination_ip)
+            destination_id = "external_endpoints"
+        edge = (node_ids[source_vm_uuid], destination_id)
+        protocol = str(connection.get("protocol", "tcp"))
+        port = connection.get("destination_port")
+        if (
+            isinstance(port, int)
+            and _GRAPH_EPHEMERAL_PORT_START <= port <= _GRAPH_EPHEMERAL_PORT_END
+        ):
+            edge_ports.setdefault(edge, set()).add(protocol)
+        else:
+            edge_ports.setdefault(edge, set()).add(f"{protocol}/{port}")
+        if len(edge_ports) >= 100:
+            break
+
+    graph_scale = zoom_percent / 100
+    lines = [
+        "digraph dependency_map {",
+        "rankdir=LR;",
+        'graph [bgcolor="transparent", pad="0.18", nodesep="0.42", ranksep="0.85", '
+        'splines="polyline"];',
+        (
+            'node [shape=box, style="rounded,filled", fontname="Arial", '
+            f'fontsize={9 * graph_scale:.1f}, margin="0.06,0.04", '
+            f'width={1.65 * graph_scale:.2f}, height={0.45 * graph_scale:.2f}, '
+            'fixedsize=true, color="#64748b", fillcolor="#e2e8f0", '
+            'fontcolor="#0f172a", penwidth=1.1];'
+        ),
+        (
+            f'edge [fontname="Arial", fontsize={8 * graph_scale:.1f}, color="#64748b", '
+            f'fontcolor="#94a3b8", arrowsize={0.65 * graph_scale:.2f}, penwidth=1.0];'
+        ),
+    ]
+    for vm_uuid, node_id in node_ids.items():
+        label = _escape_dot(_compact_graph_label(names_by_uuid.get(vm_uuid, vm_uuid), 16))
+        if vm_uuid == focus_vm_uuid:
+            lines.append(
+                f'{node_id} [label="{label}", color="#2563eb", fillcolor="#dbeafe", '
+                'penwidth=2.0];'
+            )
+        else:
+            lines.append(f'{node_id} [label="{label}"];')
+    if external_destinations:
+        lines.append(
+            'external_endpoints [label="External endpoints\\n'
+            f'{len(external_destinations)} destination(s)", color="#a47527", '
+            'fillcolor="#fef3c7", fontcolor="#3b2f10"];'
+        )
+    for edge, ports in edge_ports.items():
+        source_id, destination_id = edge
+        lines.append(
+            f'{source_id} -> {destination_id} '
+            f'[label="{_escape_dot(_compact_port_label(ports))}"];'
+        )
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _connection_display_name(connection: dict[str, object], side: str) -> str:
+    """Prefer human-readable connection names while retaining a safe fallback."""
+
+    return str(
+        connection.get(f"{side}_vm_name")
+        or connection.get(f"{side}_name")
+        or connection.get(f"{side}_vm_uuid")
+        or connection.get("destination_ip", "Unknown")
+    )
+
+
+def render_current_environment(collectors: list[dict[str, object]]) -> None:
+    """Render a read-only view of discovered inventory and observed traffic."""
+
+    st.subheader("Current Environment")
+    st.write(
+        "See the current discovered VM estate and observed network traffic. "
+        "Recommended waves below are automatic discovery output, not a migration plan."
+    )
+    if not collectors:
+        st.info("No registered collectors are available yet.")
+        return
+
+    options = {
+        f"{item['display_name']} - {item['tenant_id']} - {item['collector_id']}": item[
+            "collector_id"
+        ]
+        for item in collectors
+    }
+    selected_label = _remembered_selectbox(
+        "Collector", options, "current_environment_collector"
+    )
+    observed_after, observed_before, range_label = _observation_window("current_environment")
+    collector_id = options[selected_label]
+    try:
+        inventory = client.inventory(collector_id)
+        connections = client.connections(
+            collector_id, observed_after.isoformat(), observed_before.isoformat()
+        )
+        waves = client.waves(
+            collector_id,
+            observed_after.isoformat(),
+            observed_before.isoformat(),
+            use_approved_plan=False,
+        )
+        summary = client.wave_summary(
+            collector_id,
+            observed_after.isoformat(),
+            observed_before.isoformat(),
+            use_approved_plan=False,
+        )
+    except DashboardClientError as error:
+        st.error(str(error))
+        return
+
+    st.caption(
+        f"Observed traffic window: {range_label}. Recommended waves use the current "
+        "automatic recommendation. Graphs include at most 100 unique edges."
+    )
+
+    inventory_vm_uuids = {
+        str(item["vm_uuid"]) for item in inventory if isinstance(item.get("vm_uuid"), str)
+    }
+    inventory_names_by_uuid = {
+        str(item["vm_uuid"]): str(item.get("vm_name") or item["vm_uuid"])
+        for item in inventory
+        if isinstance(item.get("vm_uuid"), str)
+    }
+    observed_vm_uuids = set().union(
+        *(_connection_vm_uuids(item) for item in connections),
+    ) if connections else set()
+    observed_inventory_vm_uuids = inventory_vm_uuids.intersection(observed_vm_uuids)
+    st.markdown("#### VM estate")
+    estate_cards = st.columns(5)
+    estate_values = (
+        ("Active inventory VMs", len(inventory)),
+        ("Powered-on VMs", sum(item.get("power_state") == "poweredOn" for item in inventory)),
+        ("Powered-off VMs", sum(item.get("power_state") == "poweredOff" for item in inventory)),
+        ("VMs with observed traffic", len(observed_inventory_vm_uuids)),
+        ("VMs without observed traffic", len(inventory_vm_uuids - observed_inventory_vm_uuids)),
+    )
+    for column, (label, value) in zip(estate_cards, estate_values, strict=True):
+        with column:
+            card(label, value)
+
+    st.markdown("#### Recommended initial migration waves")
+    st.caption(
+        "These groups are generated from the selected inventory and observed traffic window. "
+        "They are not an approved migration plan."
+    )
+    wave_cards = st.columns(3)
+    wave_values = (
+        ("Recommended waves", int(summary.get("wave_count", len(waves)))),
+        (
+            "Waves with VM-to-VM connections",
+            int(summary.get("waves_with_observed_connections", 0)),
+        ),
+        (
+            "Waves without VM-to-VM connections",
+            int(summary.get("waves_without_observed_connections", 0)),
+        ),
+    )
+    for column, (label, value) in zip(wave_cards, wave_values, strict=True):
+        with column:
+            card(label, value)
+
+    map_view = st.radio(
+        "Map view",
+        ("Recommended wave", "Focused VM"),
+        horizontal=True,
+        key="current_environment_map_view",
+        help="Recommended wave shows one automatic group. Focused VM shows one VM and its "
+        "directly observed connections.",
+    )
+    zoom_percent = _remembered_slider(
+        "Graph zoom", 70, 200, 100, "current_environment_graph_zoom"
+    )
+    connection_scope_vm_uuids: list[str] = []
+    connection_scope_label = ""
+    if map_view == "Recommended wave":
+        if not waves:
+            st.info("No automatic migration-wave recommendation is available for this inventory.")
+        else:
+            wave_options = {
+                f"Wave {wave['wave']} - {len(wave['server_names'])} VM(s)": index
+                for index, wave in enumerate(waves)
+            }
+            selected_wave_label = _remembered_selectbox(
+                "Recommended wave", wave_options, "current_environment_wave"
+            )
+            selected_wave = waves[wave_options[selected_wave_label]]
+            selected_vm_uuids = {
+                str(vm_uuid) for vm_uuid in selected_wave["server_vm_uuids"]
+            }
+            connection_scope_vm_uuids = list(selected_vm_uuids)
+            connection_scope_label = selected_wave_label
+            st.caption(str(selected_wave.get("reason", "Automatic recommendation.")))
+            st.caption(
+                "Blue/grey nodes are discovered VMs. Gold is a collapsed group of external "
+                "destinations; use the observed-connections table for individual IP details."
+            )
+            st.graphviz_chart(
+                _dependency_map_graph(
+                    inventory_names_by_uuid,
+                    connections,
+                    selected_vm_uuids,
+                    zoom_percent=zoom_percent,
+                ),
+                width="content",
+            )
+    elif inventory_names_by_uuid:
+        focus_options = {
+            name: vm_uuid for vm_uuid, name in sorted(inventory_names_by_uuid.items(), key=lambda x: x[1])
+        }
+        focus_label = _remembered_selectbox(
+            "Focus VM", focus_options, "current_environment_focus_vm"
+        )
+        focus_vm_uuid = focus_options[focus_label]
+        connection_scope_vm_uuids = [focus_vm_uuid]
+        connection_scope_label = focus_label
+        focused_connections = [
+            item
+            for item in connections
+            if focus_vm_uuid in _connection_vm_uuids(item)
+        ]
+        displayed_vm_uuids = {focus_vm_uuid}
+        for connection in focused_connections:
+            displayed_vm_uuids.update(
+                _connection_vm_uuids(connection).intersection(inventory_vm_uuids)
+            )
+        st.caption(
+            "The selected VM is blue. Related discovered VMs are grey; external destinations "
+            "are collapsed into one gold node."
+        )
+        st.graphviz_chart(
+            _dependency_map_graph(
+                inventory_names_by_uuid,
+                focused_connections,
+                displayed_vm_uuids,
+                focus_vm_uuid=focus_vm_uuid,
+                zoom_percent=zoom_percent,
+            ),
+            width="content",
+        )
+    else:
+        st.info("No current inventory VMs are available to show in the focused map.")
+
+    st.markdown(
+        f"#### Current inventory — {connection_scope_label}"
+        if connection_scope_label
+        else "#### Current inventory"
+    )
+    inventory_search = st.text_input(
+        "Filter inventory by VM name, IP, cluster, folder, or operating system",
+        key="current_environment_inventory_search",
+    ).casefold().strip()
+    scoped_inventory = [
+        item
+        for item in inventory
+        if str(item.get("vm_uuid", "")) in connection_scope_vm_uuids
+    ]
+    inventory_rows = [
+        {
+            "VM": item.get("vm_name", ""),
+            "Hostname": item.get("hostname", ""),
+            "IP addresses": item.get("ips", ""),
+            "Power state": item.get("power_state", ""),
+            "Cluster": item.get("cluster", ""),
+            "Folder": item.get("folder", ""),
+            "Operating system": item.get("os_name", ""),
+            "Traffic observed": (
+                "Yes" if str(item.get("vm_uuid", "")) in observed_inventory_vm_uuids else "No"
+            ),
+        }
+        for item in scoped_inventory
+    ]
+    if inventory_search:
+        inventory_rows = [
+            row
+            for row in inventory_rows
+            if inventory_search in " ".join(str(value) for value in row.values()).casefold()
+        ]
+    if inventory_rows:
+        st.dataframe(inventory_rows, width="stretch", hide_index=True)
+    else:
+        st.info("No inventory VMs match the selected wave or focused VM.")
+
+    st.markdown("#### Current observed connections")
+    if not connection_scope_vm_uuids:
+        st.info("Select a recommended wave or focused VM to view its observed connections.")
+        return
+
+    page_state_key = (
+        f"current_environment_connection_page_{collector_id}_{map_view}_{connection_scope_label}"
+    )
+    st.session_state.setdefault(page_state_key, 1)
+    try:
+        scoped_connection_page = client.wave_connections(
+            collector_id,
+            connection_scope_vm_uuids,
+            observed_after.isoformat(),
+            observed_before.isoformat(),
+            st.session_state[page_state_key],
+            deduplicate=True,
+            exclude_dynamic_private_ports=True,
+        )
+    except DashboardClientError as error:
+        st.error(str(error))
+        return
+
+    scoped_connections = scoped_connection_page["items"]
+    total_connections = scoped_connection_page["total"]
+    current_page = scoped_connection_page["page"]
+    page_size = scoped_connection_page["page_size"]
+    st.caption(f"Showing {total_connections} unique connection(s) for {connection_scope_label}.")
+    connection_search = st.text_input(
+        "Filter connections by source, destination, IP, protocol, or port",
+        key="current_environment_connection_search",
+    ).casefold().strip()
+    connection_rows = [
+        {
+            "Source VM": item.get("source_vm_name", ""),
+            "Destination": (
+                item.get("destination_hostname")
+                or item.get("destination_vm_name")
+                or item.get("destination_ip", "")
+            ),
+            "Destination IP": item.get("destination_ip", ""),
+            "Connection type": "Internal" if item.get("destination_vm_uuid") else "External",
+            "Protocol": str(item.get("protocol", "")).upper(),
+            "Port": item.get("destination_port", ""),
+            "Traffic classification": item.get("traffic_class", ""),
+            "Evidence": item.get("evidence", ""),
+            "Observations": item.get("observation_count", ""),
+        }
+        for item in scoped_connections
+    ]
+    if connection_search:
+        connection_rows = [
+            row
+            for row in connection_rows
+            if connection_search in " ".join(str(value) for value in row.values()).casefold()
+    ]
+    st.dataframe(connection_rows, width="stretch", hide_index=True)
+    total_pages = max(1, (total_connections + page_size - 1) // page_size)
+    if total_pages > 1:
+        previous, page_label, next_page = st.columns((1, 3, 1))
+        with previous:
+            if st.button("Previous", key=f"current_environment_previous_{page_state_key}"):
+                st.session_state[page_state_key] = max(1, current_page - 1)
+                st.rerun()
+        with page_label:
+            st.caption(
+                f"Page {current_page} of {total_pages}; showing up to {page_size} rows per page."
+            )
+        with next_page:
+            if st.button("Next", key=f"current_environment_next_{page_state_key}"):
+                st.session_state[page_state_key] = min(total_pages, current_page + 1)
+                st.rerun()
+
+
 def render_migration_waves(collectors: list[dict[str, object]]) -> None:
     """Render one collector's reporting window without resetting dashboard choices."""
 
@@ -396,11 +814,7 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
     if not collectors:
         st.info("No registered collectors are available yet.")
         return
-    controls, refresh_control = st.columns((4, 1))
-    with controls:
-        st.caption("Use Refresh now to load the latest inventory and connection data.")
-    with refresh_control:
-        st.button("Refresh now", key="refresh_migration_waves", width="stretch")
+    action_controls = st.empty()
     options = {
         f"{item['display_name']} - {item['tenant_id']} - {item['collector_id']}": item[
             "collector_id"
@@ -411,23 +825,39 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
     observed_after, observed_before, range_label = _observation_window()
     selected_collector_id = options[selected_label]
     try:
+        plans = client.migration_plans(selected_collector_id)
+    except DashboardClientError as error:
+        st.error(str(error))
+        return
+    approved_plan = next((plan for plan in plans if plan["status"] == "approved"), None)
+    display_options = {"Automatic recommendation": "recommended"}
+    if approved_plan is not None:
+        display_options = {
+            f"Latest approved plan (V{approved_plan['version']})": "approved",
+            **display_options,
+        }
+    selected_display = _remembered_selectbox(
+        "Display", display_options, "wave_display"
+    )
+    use_approved_plan = display_options[selected_display] == "approved"
+    try:
         summary = client.wave_summary(
             selected_collector_id,
             observed_after.isoformat(),
             observed_before.isoformat(),
-            use_approved_plan=False,
+            use_approved_plan=use_approved_plan,
         )
         waves = client.waves(
             selected_collector_id,
             observed_after.isoformat(),
             observed_before.isoformat(),
-            use_approved_plan=False,
+            use_approved_plan=use_approved_plan,
         )
         readiness = client.wave_readiness(
             selected_collector_id,
             observed_after.isoformat(),
             observed_before.isoformat(),
-            use_approved_plan=False,
+            use_approved_plan=use_approved_plan,
         )
         plan_drift = client.plan_drift(selected_collector_id)
         connections = client.connections(
@@ -438,11 +868,9 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
         return
 
     st.caption(
-        f"Reporting window: {range_label}. This page and its reports show the current automatic "
-        "recommendation, not an approved migration plan. Graphs include at most 100 unique edges."
-    )
-    st.caption(
-        "Potential ephemeral ports (32768–65535) are hidden from graph labels; "
+        f"Reporting window: {range_label}. Display: {selected_display}. Graphs include at most "
+        "100 unique edges. "
+        "| Potential ephemeral ports (32768-65535) are hidden from graph labels; "
         "full port values remain in the observed-connections table."
     )
     selected_collector = next(
@@ -459,32 +887,75 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
         detailed_report = build_detailed_report(
             selected_collector, waves, detailed_connections, range_label
         )
-        st.download_button(
-            "Download executive report (PDF)",
-            data=executive_report,
-            file_name=executive_report_filename(
-                selected_collector["display_name"], report_created_at
-            ),
-            mime="application/pdf",
-            key=f"executive_report_{selected_collector_id}_{range_label}",
-        )
-        st.download_button(
-            "Download detailed report (Excel)",
-            data=detailed_report,
-            file_name=detailed_report_filename(
-                selected_collector["display_name"], report_created_at
-            ),
-            mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
-            key=f"detailed_report_{selected_collector_id}_{range_label}",
-        )
+        with action_controls.container():
+            guidance_column, action_group = st.columns((5, 3), gap="small")
+            with guidance_column:
+                st.caption("Use Refresh now to load the latest inventory and connection data.")
+            with action_group:
+                with st.container(
+                    horizontal=True, horizontal_alignment="right", gap="small"
+                ):
+                    st.button(
+                        "Refresh now",
+                        key="refresh_migration_waves",
+                        type="primary",
+                        icon="🔄",
+                        width="content",
+                        help="Reload the latest inventory and connection data.",
+                    )
+                    st.download_button(
+                        "Executive report (PDF)",
+                        data=executive_report,
+                        file_name=executive_report_filename(
+                            selected_collector["display_name"], report_created_at
+                        ),
+                        mime="application/pdf",
+                        key=f"executive_report_{selected_collector_id}_{range_label}",
+                        type="primary",
+                        icon="⬇️",
+                        width="content",
+                        help="Download the executive migration-wave summary as a PDF.",
+                    )
+                    st.download_button(
+                        "Detailed report (Excel)",
+                        data=detailed_report,
+                        file_name=detailed_report_filename(
+                            selected_collector["display_name"], report_created_at
+                        ),
+                        mime=("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                        key=f"detailed_report_{selected_collector_id}_{range_label}",
+                        type="primary",
+                        icon="⬇️",
+                        width="content",
+                        help=(
+                            "Download deduplicated TCP/UDP connection evidence as an Excel "
+                            "workbook."
+                        ),
+                    )
     except (DashboardClientError, KeyError, TypeError, ValueError):
+        with action_controls.container():
+            guidance_column, refresh_column = st.columns((7, 1), gap="small")
+            with guidance_column:
+                st.caption("Use Refresh now to load the latest inventory and connection data.")
+            with refresh_column:
+                st.button(
+                    "Refresh now",
+                    key="refresh_migration_waves",
+                    type="primary",
+                    icon="🔄",
+                    width="content",
+                    help="Reload the latest inventory and connection data.",
+                )
         st.warning("The selected reports could not be generated for the reporting window.")
     summary_cards: list[tuple[str, int | str]] = [
         ("Migration waves", summary["wave_count"]),
         ("Active inventory VMs", summary["active_inventory_vm_count"]),
         ("Eligible powered-on VMs", summary["eligible_vm_count"]),
         ("Waves with VM-to-VM connections", summary["waves_with_observed_connections"]),
-        ("VMs without connections", summary["vms_without_observed_connections"]),
+        (
+            "Waves without VM-to-VM connections",
+            summary["waves_without_observed_connections"],
+        ),
     ]
     cards = st.columns(len(summary_cards))
     for column, (label, value) in zip(cards, summary_cards, strict=True):
@@ -495,18 +966,18 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
     readiness_filter_key = f"wave_readiness_filter_{selected_collector_id}"
     st.session_state.setdefault(readiness_filter_key, "All waves")
     drift_card = _plan_drift_card(plan_drift)
-    readiness_filters = (
-        ("All waves", len(readiness_rows)),
+    readiness_categories = (
+        "Ready for approval",
+        "Evidence needs refresh",
+        "Needs review",
+        "High risk",
+    )
+    readiness_filters = (("All waves", len(readiness_rows)),) + tuple(
         (
-            "Ready for approval",
-            sum(
-                1
-                for item in readiness_rows
-                if item["confidence"] == "High" and item["risk"] == "Low"
-            ),
-        ),
-        ("Needs review", sum(1 for item in readiness_rows if item["risk"] == "Medium")),
-        ("High risk", sum(1 for item in readiness_rows if item["risk"] == "High")),
+            label,
+            sum(1 for item in readiness_rows if _readiness_category(item) == label),
+        )
+        for label in readiness_categories
     )
     readiness_cards = st.columns(len(readiness_filters) + (1 if drift_card else 0))
     for column, (label, value) in zip(
@@ -517,7 +988,7 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
                 label,
                 value,
                 critical=label == "High risk" and value > 0,
-                warning=label == "Needs review" and value > 0,
+                warning=label in {"Evidence needs refresh", "Needs review"} and value > 0,
                 success=label == "Ready for approval" and value > 0,
             )
     if drift_card is not None:
@@ -534,18 +1005,6 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
                 href=drift_href,
                 critical="Critical" in drift_card[1],
             )
-    with st.expander("How confidence and risk are calculated"):
-        st.markdown(
-            "**Confidence** measures the quality and freshness of the evidence, not cutover "
-            "approval. High requires at least 80% observation coverage for the selected window, "
-            "inventory no older than 7 days, a collector check-in within 180 seconds, and at least "
-            "one observation. Low applies below 40% coverage, when inventory is over 30 days old, "
-            "or when there are no observations. The remaining cases are Medium.\n\n"
-            "**Risk** measures unresolved dependency work. High means at least one high-impact "
-            "dependency; Medium means action-required or investigate items remain; Low means no "
-            "unresolved review dependency was found. **Ready for approval** means High confidence "
-            "and Low risk—it is a planning signal, not automatic cutover authorization."
-        )
     previous_readiness_filter = st.session_state[readiness_filter_key]
     st.radio(
         "Filter readiness table",
@@ -560,6 +1019,7 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
     readiness_table_rows = [
         {
             "Wave": f"Wave {wave['wave']} - {len(wave['server_names'])} VM(s)",
+            "Readiness": _readiness_category(readiness_by_wave[wave["wave"]]),
             "Confidence": readiness_by_wave[wave["wave"]]["confidence"],
             "Risk": readiness_by_wave[wave["wave"]]["risk"],
             "Review dependencies": readiness_by_wave[wave["wave"]]["review_dependency_count"],
@@ -571,16 +1031,10 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
         for wave in waves
     ]
     selected_readiness_filter = st.session_state[readiness_filter_key]
-    if selected_readiness_filter == "Ready for approval":
+    if selected_readiness_filter != "All waves":
         readiness_table_rows = [
-            row
-            for row in readiness_table_rows
-            if row["Confidence"] == "High" and row["Risk"] == "Low"
+            row for row in readiness_table_rows if row["Readiness"] == selected_readiness_filter
         ]
-    elif selected_readiness_filter == "Needs review":
-        readiness_table_rows = [row for row in readiness_table_rows if row["Risk"] == "Medium"]
-    elif selected_readiness_filter == "High risk":
-        readiness_table_rows = [row for row in readiness_table_rows if row["Risk"] == "High"]
     st.caption(f"Showing: {selected_readiness_filter}")
     readiness_page_size = 20
     readiness_page_key = f"wave_readiness_page_{selected_collector_id}"
@@ -612,7 +1066,6 @@ def render_migration_waves(collectors: list[dict[str, object]]) -> None:
             if st.button("Next", key="readiness_next"):
                 st.session_state[readiness_page_key] = min(readiness_page_count, readiness_page + 1)
                 st.rerun()
-
     if not waves:
         st.info("No eligible powered-on VMs are available in this collector inventory.")
         return
@@ -815,7 +1268,7 @@ def render_migration_plan(collectors: list[dict[str, object]]) -> None:
                     source_label = st.selectbox("Approved plan", approved_options)
                     planner_name = st.text_input("Planner name", key="clone_plan_planner")
                     plan_note = st.text_area("Version note (optional)", key="clone_plan_note")
-                    clone = st.form_submit_button("Create draft version")
+                    clone = st.form_submit_button("Create draft version", type="primary")
                 if clone:
                     try:
                         client.clone_migration_plan(
@@ -909,12 +1362,15 @@ def render_migration_plan(collectors: list[dict[str, object]]) -> None:
             selected_collector, plan, plan_readiness, plan_dependencies, drift
         )
         st.download_button(
-            "Download plan package (PDF)",
+            "Plan package (PDF)",
             data=plan_pdf,
             file_name=plan_report_filename(selected_collector["display_name"], plan, "pdf"),
             mime="application/pdf",
             key=f"plan_pdf_{plan['plan_id']}",
+            type="primary",
+            icon="⬇️",
             width="stretch",
+            help="Download the selected migration-plan version as a PDF package.",
         )
     except (DashboardClientError, KeyError, TypeError, ValueError):
         st.warning("The selected plan PDF package could not be generated.")
@@ -932,12 +1388,15 @@ def render_migration_plan(collectors: list[dict[str, object]]) -> None:
             plan_connections,
         )
         st.download_button(
-            "Download plan workbook (Excel)",
+            "Plan workbook (Excel)",
             data=plan_excel,
             file_name=plan_report_filename(selected_collector["display_name"], plan, "xlsx"),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key=f"plan_excel_{plan['plan_id']}",
+            type="primary",
+            icon="⬇️",
             width="stretch",
+            help="Download the selected plan and its technical evidence as Excel.",
         )
     except (DashboardClientError, KeyError, TypeError, ValueError):
         st.warning(
@@ -1170,12 +1629,14 @@ def render_dependency_review(collectors: list[dict[str, object]]) -> None:
         for item in items
         if item.get("category") == "Unavailable internal VM" and item.get("unavailable_vm_uuid")
     }
-    cards = st.columns(5)
+    not_reviewed_count = _not_reviewed_dependency_count(items)
+    cards = st.columns(6)
     card_values = (
         (
             "Wave members" if selected_wave_index is not None else "Active inventory VMs",
             len(active_vm_uuids),
         ),
+        ("Not reviewed", not_reviewed_count),
         ("VMs with review dependencies", len(reviewed_vm_uuids)),
         ("External endpoints", len(external_endpoints)),
         ("Shared services", len(shared_services)),
@@ -1183,7 +1644,7 @@ def render_dependency_review(collectors: list[dict[str, object]]) -> None:
     )
     for column, (label, value) in zip(cards, card_values, strict=True):
         with column:
-            card(label, value)
+            card(label, value, warning=label == "Not reviewed" and value > 0)
     st.caption(
         f"Review scope: {len(active_vm_uuids)} active wave member(s); "
         f"{len(reviewed_vm_uuids)} VM(s) have review dependencies."
@@ -1206,6 +1667,21 @@ def render_dependency_review(collectors: list[dict[str, object]]) -> None:
     if not filtered_items:
         st.info("No review dependencies were found for the selected filters and time range.")
         return
+    readiness_status_filter = st.selectbox(
+        "Readiness status filter",
+        ("All", "Action required", "Investigate", "High impact", "Advisory", "Resolved"),
+        key="dependency_readiness_status_filter",
+    )
+    if readiness_status_filter != "All":
+        filtered_items = [
+            item
+            for item in filtered_items
+            if dependency_readiness_status(
+                str(item.get("planner_decision") or "") or None,
+                str(item.get("category") or ""),
+            )
+            == readiness_status_filter
+        ]
     review_filter = st.selectbox(
         "Planner review filter",
         ("Not reviewed", "Reviewed", "All"),
@@ -1313,6 +1789,10 @@ def render_dependency_review(collectors: list[dict[str, object]]) -> None:
                 "Port/service": item.get("port_service"),
                 "Observations": item.get("observation_count"),
                 "Planner decision": item.get("planner_decision") or "Not reviewed",
+                "Readiness status": dependency_readiness_status(
+                    str(item.get("planner_decision") or "") or None,
+                    str(item.get("category") or ""),
+                ),
                 "Planner note": item.get("planner_note") or "",
                 "Review reason": item.get("reason"),
             }
@@ -1331,7 +1811,7 @@ with st.sidebar:
     st.caption("OCI-hosted collector management and dependency reporting.")
     page = st.radio(
         "Navigation",
-        _NAVIGATION_PAGES,
+        _DASHBOARD_NAVIGATION_PAGES,
         label_visibility="collapsed",
         key="dashboard_page",
     )
@@ -1417,7 +1897,9 @@ else:
         st.error(str(error))
         st.stop()
 
-if page == "Agent Collector's Status":
+if page == "Current Environment":
+    render_current_environment(collectors)
+elif page == "Agent Collector's Status":
     st.subheader("Agent Collector's Status")
     online = sum(item["status"] == "online" for item in collectors)
     left, middle, right = st.columns(3)

@@ -52,6 +52,8 @@ class ControlPlaneDashboardClient:
         observed_before: str,
         page: int,
         page_size: int = 100,
+        deduplicate: bool = False,
+        exclude_dynamic_private_ports: bool = False,
     ) -> dict[str, Any]:
         response = self._get(
             self._with_query(
@@ -62,6 +64,8 @@ class ControlPlaneDashboardClient:
                     "observed_before": observed_before,
                     "page": page,
                     "page_size": page_size,
+                    "deduplicate": deduplicate,
+                    "exclude_dynamic_private_ports": exclude_dynamic_private_ports,
                 },
             )
         )

@@ -36,6 +36,27 @@ _CANDIDATE_SHARED_TCP_SERVICES = {
 }
 _DYNAMIC_PRIVATE_PORT_START = 32768
 _DYNAMIC_PRIVATE_PORT_END = 65535
+_READINESS_STATUS_BY_DECISION = {
+    "Not relevant / excluded": "Resolved",
+    "External dependency accepted": "Resolved",
+    "Confirmed shared service": "Resolved",
+    "Soft dependency": "Advisory",
+    "Network/firewall action required": "Action required",
+    "DNS/routing action required": "Action required",
+    "Target service setup required": "Action required",
+    "Owner validation required": "Investigate",
+    "Investigate before cutover": "Investigate",
+    "Confirmed hard dependency": "High impact",
+    "Requires hybrid plan": "High impact",
+}
+
+
+def dependency_readiness_status(decision: str | None, category: str) -> str:
+    """Map a planner decision to the one status used by readiness views."""
+
+    if not decision and category == "Unavailable internal VM":
+        return "High impact"
+    return _READINESS_STATUS_BY_DECISION.get(decision or "", "Investigate")
 
 
 def _traffic_class(protocol: str, destination_port: int) -> str:
@@ -154,12 +175,15 @@ def wave_connection_report(
     observed_before: datetime | None = None,
     page: int = 1,
     page_size: int = 100,
+    deduplicate: bool = False,
+    exclude_dynamic_private_ports: bool = False,
 ) -> dict[str, object]:
     """Return one bounded page of evidence for the selected wave VMs.
 
     Filtering happens in the database before pagination.  This prevents a busy
     collector's newest global observations from hiding older evidence for a
-    smaller selected wave.
+    smaller selected wave. When requested, repeated observations of one logical
+    connection are collapsed before pagination.
     """
 
     selected_vm_uuids = set(vm_uuids)
@@ -179,6 +203,84 @@ def wave_connection_report(
     if selected_ips:
         endpoint_filters.append(Observation.destination_ip.in_(selected_ips))
     filters.append(or_(*endpoint_filters))
+    if exclude_dynamic_private_ports:
+        filters.append(
+            or_(
+                Observation.destination_port < _DYNAMIC_PRIVATE_PORT_START,
+                Observation.destination_port > _DYNAMIC_PRIVATE_PORT_END,
+            )
+        )
+
+    all_vms_by_uuid = {vm.vm_uuid: vm for vm in inventory}
+    all_vms_by_ip = _vms_by_ip(inventory)
+    if deduplicate:
+        grouped = (
+            select(
+                Observation.source_vm_uuid,
+                Observation.destination_ip,
+                Observation.destination_port,
+                Observation.protocol,
+                func.count().label("observation_count"),
+                func.min(Observation.observed_at).label("first_observed"),
+                func.max(Observation.observed_at).label("last_observed"),
+            )
+            .where(*filters)
+            .group_by(
+                Observation.source_vm_uuid,
+                Observation.destination_ip,
+                Observation.destination_port,
+                Observation.protocol,
+            )
+            .order_by(
+                Observation.source_vm_uuid,
+                Observation.destination_ip,
+                Observation.protocol,
+                Observation.destination_port,
+            )
+        )
+        total = session.scalar(select(func.count()).select_from(grouped.subquery())) or 0
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        current_page = min(page, total_pages)
+        rows = session.execute(
+            grouped.offset((current_page - 1) * page_size).limit(page_size)
+        ).all()
+        items: list[dict[str, object]] = []
+        for (
+            source_vm_uuid,
+            destination_ip,
+            destination_port,
+            protocol,
+            observation_count,
+            first_observed,
+            last_observed,
+        ) in rows:
+            source = all_vms_by_uuid.get(source_vm_uuid)
+            if source is None:
+                continue
+            destination = all_vms_by_ip.get(destination_ip)
+            items.append(
+                {
+                    "source_vm_uuid": source.vm_uuid,
+                    "source_vm_name": source.name,
+                    "destination_ip": destination_ip,
+                    "destination_vm_uuid": destination.vm_uuid if destination else None,
+                    "destination_vm_name": destination.name if destination else None,
+                    "destination_hostname": (destination.hostname or destination.name)
+                    if destination
+                    else None,
+                    "destination_power_state": destination.power_state if destination else None,
+                    "destination_port": destination_port,
+                    "protocol": protocol,
+                    "traffic_class": _traffic_class(protocol, destination_port),
+                    "evidence": (
+                        "Observed once" if observation_count == 1 else "Observed repeatedly"
+                    ),
+                    "observation_count": observation_count,
+                    "first_observed": first_observed.isoformat(),
+                    "last_observed": last_observed.isoformat(),
+                }
+            )
+        return {"items": items, "page": current_page, "page_size": page_size, "total": total}
 
     total = session.scalar(select(func.count()).select_from(Observation).where(*filters)) or 0
     total_pages = max(1, (total + page_size - 1) // page_size)
@@ -190,8 +292,6 @@ def wave_connection_report(
         .offset((current_page - 1) * page_size)
         .limit(page_size)
     ).all()
-    all_vms_by_uuid = {vm.vm_uuid: vm for vm in inventory}
-    all_vms_by_ip = _vms_by_ip(inventory)
     items: list[dict[str, object]] = []
     for observation in observations:
         source = all_vms_by_uuid.get(observation.source_vm_uuid)
@@ -775,22 +875,10 @@ def wave_readiness_report(
             )
             saved_decision = decision_keys.get(key)
             decision = saved_decision.decision if saved_decision else "Not reviewed"
-            status_by_decision = {
-                "Not relevant / excluded": "Resolved",
-                "External dependency accepted": "Resolved",
-                "Confirmed shared service": "Resolved",
-                "Soft dependency": "Advisory",
-                "Network/firewall action required": "Action required",
-                "DNS/routing action required": "Action required",
-                "Target service setup required": "Action required",
-                "Owner validation required": "Investigate",
-                "Investigate before cutover": "Investigate",
-                "Confirmed hard dependency": "High impact",
-                "Requires hybrid plan": "High impact",
-            }
-            readiness_status = status_by_decision.get(decision, "Investigate")
-            if decision == "Not reviewed" and item["category"] == "Unavailable internal VM":
-                readiness_status = "High impact"
+            readiness_status = dependency_readiness_status(
+                None if decision == "Not reviewed" else decision,
+                str(item["category"]),
+            )
             review_counts[readiness_status] += 1
             review_items.append(
                 {
