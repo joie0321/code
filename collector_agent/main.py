@@ -13,6 +13,7 @@ from collector_agent.schemas import (
     AwsCredentialsRequest,
     AwsFlowLogSettingsRequest,
     AzureCredentialsRequest,
+    AzureFlowLogSettingsRequest,
     IpfixStartRequest,
     LocalCredentialsRequest,
     LocalObservation,
@@ -81,6 +82,14 @@ def create_app(
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
+    @app.post("/api/v1/setup/azure/flow-logs")
+    def configure_azure_flow_logs(payload: AzureFlowLogSettingsRequest) -> dict[str, str]:
+        try:
+            active_runtime.configure_azure_flow_logs(payload)
+            return {"status": "stored_in_memory"}
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @app.post("/api/v1/setup/aws/credentials")
     def configure_aws_credentials(payload: AwsCredentialsRequest) -> dict[str, str]:
         try:
@@ -108,6 +117,13 @@ def create_app(
     def sync_aws_flow_logs(collector_id: str) -> dict[str, int]:
         try:
             return active_runtime.sync_aws_flow_logs(collector_id)
+        except (ControlPlaneClientError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/v1/azure/flow-logs/sync")
+    def sync_azure_flow_logs(collector_id: str) -> dict[str, int]:
+        try:
+            return active_runtime.sync_azure_flow_logs(collector_id)
         except (ControlPlaneClientError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 

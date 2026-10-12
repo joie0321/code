@@ -42,6 +42,14 @@ class AgentDashboardClient:
     def configure_azure_credentials(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("/api/v1/setup/azure/credentials", payload)
 
+    def configure_azure_flow_logs(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return self._request("/api/v1/setup/azure/flow-logs", payload)
+
+    def sync_azure_flow_logs(self, collector_id: str) -> dict[str, Any]:
+        return self._request(
+            f"/api/v1/azure/flow-logs/sync?{urlencode({'collector_id': collector_id})}", {}
+        )
+
     def configure_aws_credentials(self, payload: dict[str, Any]) -> dict[str, Any]:
         return self._request("/api/v1/setup/aws/credentials", payload)
 

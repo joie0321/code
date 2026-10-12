@@ -416,10 +416,7 @@ elif page == "Azure Setup":
             st.error(str(error))
 
     st.subheader("Synchronize inventory")
-    st.caption(
-        "The initial Azure connector inventories virtual machines and their private NIC IPs. "
-        "Azure flow-log ingestion will be added separately."
-    )
+    st.caption("The Azure connector inventories virtual machines and their private NIC IPs.")
     if st.button("Sync Azure inventory", type="primary"):
         try:
             result = client.sync_inventory(selected_collector_id)
@@ -430,6 +427,63 @@ elif page == "Azure Setup":
             )
         except AgentDashboardClientError as error:
             st.error(str(error))
+
+    st.divider()
+    st.subheader("Azure Virtual Network Flow Logs")
+    st.caption(
+        "The collector reads only new JSON blob versions from this customer-owned Azure Storage "
+        "location. It polls automatically with the agent heartbeat and can also be refreshed now."
+    )
+    with st.form("azure_flow_logs"):
+        azure_storage_account_name = st.text_input("Storage account name")
+        azure_container_name = st.text_input(
+            "Blob container", value="insights-logs-flowlogflowevent"
+        )
+        azure_flow_log_prefix = st.text_input("Blob prefix", value="flowLogResourceID=/")
+        configure_azure_flow_logs = st.form_submit_button(
+            "Store Virtual Network Flow Log location in memory"
+        )
+    if configure_azure_flow_logs:
+        try:
+            client.configure_azure_flow_logs(
+                {
+                    "collector_id": selected_collector_id,
+                    "storage_account_name": azure_storage_account_name,
+                    "container_name": azure_container_name,
+                    "prefix": azure_flow_log_prefix,
+                }
+            )
+            st.success("Azure Virtual Network Flow Log location is held in collector memory.")
+        except AgentDashboardClientError as error:
+            st.error(str(error))
+    if selected_source.get("azure_flow_logs_configured"):
+        flow_log_columns = st.columns(3)
+        flow_log_columns[0].metric(
+            "Blob versions processed", selected_source.get("azure_flow_log_objects_processed", 0)
+        )
+        flow_log_columns[1].metric(
+            "Observations uploaded",
+            selected_source.get("azure_flow_log_observations_uploaded", 0),
+        )
+        flow_log_columns[2].metric(
+            "Flow Log status", selected_source.get("azure_flow_log_status", "Waiting")
+        )
+        if selected_source.get("azure_flow_log_last_sync_at"):
+            st.caption(
+                "Last Virtual Network Flow Log sync: "
+                f"{selected_source['azure_flow_log_last_sync_at']}"
+            )
+        if st.button("Sync Azure Virtual Network Flow Logs now"):
+            try:
+                result = client.sync_azure_flow_logs(selected_collector_id)
+                st.success(
+                    "Virtual Network Flow Logs synchronized: "
+                    f"{result['objects_processed']} blob version(s) processed, "
+                    f"{result['observations_uploaded']} observation(s) uploaded."
+                )
+                st.rerun()
+            except AgentDashboardClientError as error:
+                st.error(str(error))
 
 elif page == "AWS Setup":
     st.subheader("AWS setup")

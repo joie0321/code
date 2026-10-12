@@ -76,7 +76,7 @@ class ControlPlaneClient:
             if isinstance(detail, list):
                 raise ControlPlaneClientError(
                     "Control plane rejected the observation format. "
-                    "Restart the control-plane API with the current AWS schema."
+                    "Restart the control-plane API from the same app release as the collector."
                 ) from error
             raise ControlPlaneClientError("Control-plane request failed") from error
         except (URLError, TimeoutError, json.JSONDecodeError) as error:

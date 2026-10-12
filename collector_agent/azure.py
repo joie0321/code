@@ -37,17 +37,26 @@ def _resource_rows(result: Any) -> list[dict[str, Any]]:
     return [item for item in values if isinstance(item, dict)] if isinstance(values, list) else []
 
 
-def _private_ips(properties: object) -> list[str]:
-    if not isinstance(properties, dict):
-        return []
-    value = properties.get("ipConfigurations")
-    if not isinstance(value, list):
+def _private_ips(value: object) -> list[str]:
+    """Return valid private addresses from projected or nested NIC configurations."""
+
+    configurations = value.get("ipConfigurations") if isinstance(value, dict) else value
+    if not isinstance(configurations, list):
         return []
     addresses: set[str] = set()
-    for ip_configuration in value:
+    for ip_configuration in configurations:
         if not isinstance(ip_configuration, dict):
             continue
-        address = ip_configuration.get("privateIPAddress")
+        # Resource Graph returns an IP configuration as a nested ARM resource:
+        # ``properties.ipConfigurations[*].properties.privateIPAddress``.
+        # Retain the flat lookup as a compatibility fallback for previously
+        # projected/test payloads.
+        configuration_properties = ip_configuration.get("properties")
+        address = (
+            configuration_properties.get("privateIPAddress")
+            if isinstance(configuration_properties, dict)
+            else ip_configuration.get("privateIPAddress")
+        )
         if isinstance(address, str):
             try:
                 addresses.add(str(ip_address(address)))
@@ -60,7 +69,9 @@ def map_inventory(vm_rows: list[dict[str, Any]], nic_rows: list[dict[str, Any]])
     """Map Resource Graph VM/NIC rows to the control plane's normalized inventory."""
 
     ips_by_nic_id = {
-        str(row.get("id", "")).lower(): _private_ips(row.get("properties"))
+        str(row.get("id", "")).lower(): _private_ips(
+            row.get("ipConfigurations", row.get("properties"))
+        )
         for row in nic_rows
         if isinstance(row.get("id"), str)
     }
@@ -76,7 +87,7 @@ def map_inventory(vm_rows: list[dict[str, Any]], nic_rows: list[dict[str, Any]])
         network_profile = properties.get("networkProfile")
         if not isinstance(network_profile, dict):
             network_profile = {}
-        nic_references = network_profile.get("networkInterfaces")
+        nic_references = row.get("nicReferences", network_profile.get("networkInterfaces"))
         nic_ids = (
             [
                 str(nic.get("id")).lower()
@@ -87,12 +98,18 @@ def map_inventory(vm_rows: list[dict[str, Any]], nic_rows: list[dict[str, Any]])
             else []
         )
         ips = sorted({address for nic_id in nic_ids for address in ips_by_nic_id.get(nic_id, [])})
-        os_profile = properties.get("storageProfile")
-        os_disk = os_profile.get("osDisk") if isinstance(os_profile, dict) else None
-        os_type = os_disk.get("osType") if isinstance(os_disk, dict) else None
+        storage_profile = properties.get("storageProfile")
+        os_disk = storage_profile.get("osDisk") if isinstance(storage_profile, dict) else None
+        os_type = row.get("osType") or (
+            os_disk.get("osType") if isinstance(os_disk, dict) else None
+        )
+        os_profile = properties.get("osProfile")
+        hostname = row.get("computerName") or (
+            os_profile.get("computerName") if isinstance(os_profile, dict) else None
+        )
         extended = properties.get("extended")
         instance_view = extended.get("instanceView") if isinstance(extended, dict) else None
-        power_code = (
+        power_code = row.get("powerState") or (
             instance_view.get("powerState", {}).get("code")
             if isinstance(instance_view, dict)
             else None
@@ -104,7 +121,7 @@ def map_inventory(vm_rows: list[dict[str, Any]], nic_rows: list[dict[str, Any]])
             VmRecord(
                 vm_uuid=str(uuid5(NAMESPACE_URL, resource_id.lower())),
                 name=name,
-                hostname=None,
+                hostname=str(hostname) if hostname else None,
                 ips=ips,
                 cluster=str(row.get("resourceGroup")) if row.get("resourceGroup") else None,
                 folder=str(row.get("subscriptionId")) if row.get("subscriptionId") else None,
@@ -136,12 +153,16 @@ def fetch_vms(credentials: AzureCredentials) -> list[VmRecord]:
     vm_query = """
         Resources
         | where type =~ 'microsoft.compute/virtualmachines'
-        | project id, name, subscriptionId, resourceGroup, properties
+        | project id, name, subscriptionId, resourceGroup,
+            nicReferences = properties.networkProfile.networkInterfaces,
+            computerName = properties.osProfile.computerName,
+            osType = properties.storageProfile.osDisk.osType,
+            powerState = properties.extended.instanceView.powerState.code
     """
     nic_query = """
         Resources
         | where type =~ 'microsoft.network/networkinterfaces'
-        | project id, properties
+        | project id, ipConfigurations = properties.ipConfigurations
     """
     options = {"subscriptions": credentials.subscription_ids}
     vm_rows = _resource_rows(client.resources(QueryRequest(query=vm_query, **options)))

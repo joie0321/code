@@ -19,6 +19,14 @@ from collector_agent.aws_flow_logs import (
 )
 from collector_agent.azure import AzureCredentials
 from collector_agent.azure import fetch_vms as fetch_azure_vms
+from collector_agent.azure_flow_logs import (
+    AzureFlowLogError,
+    AzureFlowLogReadResult,
+    AzureFlowLogSettings,
+)
+from collector_agent.azure_flow_logs import (
+    fetch_flow_log_observations as fetch_azure_flow_log_observations,
+)
 from collector_agent.client import ControlPlaneClient, ControlPlaneClientError
 from collector_agent.config import AgentSettings
 from collector_agent.ipfix import IpfixFlow, IpfixListener
@@ -26,6 +34,7 @@ from collector_agent.schemas import (
     AwsCredentialsRequest,
     AwsFlowLogSettingsRequest,
     AzureCredentialsRequest,
+    AzureFlowLogSettingsRequest,
     IpfixStartRequest,
     LocalCredentialsRequest,
     ReconnectRequest,
@@ -54,6 +63,12 @@ class _SourceProfile:
     source_type: str = "vmware"
     vcenter_credentials: VCenterCredentials | None = None
     azure_credentials: AzureCredentials | None = None
+    azure_flow_log_settings: AzureFlowLogSettings | None = None
+    azure_flow_log_object_versions: set[str] = field(default_factory=set)
+    azure_flow_log_last_sync_at: datetime | None = None
+    azure_flow_log_objects_processed: int = 0
+    azure_flow_log_observations_uploaded: int = 0
+    azure_flow_log_last_error: str | None = None
     aws_credentials: AwsCredentials | None = None
     aws_flow_log_settings: AwsFlowLogSettings | None = None
     aws_flow_log_object_keys: set[str] = field(default_factory=set)
@@ -86,6 +101,7 @@ class AgentRuntime:
         azure_inventory_fetcher: Any = fetch_azure_vms,
         aws_inventory_fetcher: Any = fetch_aws_vms,
         aws_flow_log_fetcher: Any = fetch_flow_log_observations,
+        azure_flow_log_fetcher: Any = fetch_azure_flow_log_observations,
     ):
         settings.validate_runtime()
         self._settings = settings
@@ -95,6 +111,7 @@ class AgentRuntime:
         self._azure_inventory_fetcher = azure_inventory_fetcher
         self._aws_inventory_fetcher = aws_inventory_fetcher
         self._aws_flow_log_fetcher = aws_flow_log_fetcher
+        self._azure_flow_log_fetcher = azure_flow_log_fetcher
         self._lock = Lock()
         self._stop = Event()
         self._sources: dict[str, _SourceProfile] = {}
@@ -207,6 +224,94 @@ class AgentRuntime:
                 subscription_ids=request.subscription_ids,
             )
             profile.last_error = None
+
+    def configure_azure_flow_logs(self, request: AzureFlowLogSettingsRequest) -> None:
+        """Configure a read-only Azure Blob Virtual Network Flow Log location."""
+
+        with self._lock:
+            profile = self._source_or_raise(request.collector_id)
+            if profile.source_type != "azure":
+                raise ValueError(
+                    "Select an Azure source before configuring Virtual Network Flow Logs"
+                )
+            profile.azure_flow_log_settings = AzureFlowLogSettings(
+                storage_account_name=request.storage_account_name,
+                container_name=request.container_name,
+                prefix=request.prefix,
+            )
+            profile.azure_flow_log_object_versions.clear()
+            profile.azure_flow_log_last_error = None
+
+    def sync_azure_flow_logs(self, collector_id: str) -> dict[str, int]:
+        """Read unseen Azure VNet Flow Log blobs and upload inventory-matched observations."""
+
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            if profile.source_type != "azure":
+                raise ValueError("Virtual Network Flow Logs are available only for Azure sources")
+            if profile.azure_credentials is None:
+                raise ValueError(
+                    "Configure Azure credentials before synchronizing Virtual Network Flow Logs"
+                )
+            if profile.azure_flow_log_settings is None:
+                raise ValueError("Configure the Azure Blob Flow Log location before synchronizing")
+            credentials = profile.azure_credentials
+            settings = profile.azure_flow_log_settings
+            known_versions = set(profile.azure_flow_log_object_versions)
+            source_vm_uuid_by_ip = dict(profile.source_vm_uuid_by_ip)
+        try:
+            result: AzureFlowLogReadResult = self._azure_flow_log_fetcher(
+                credentials, settings, known_versions
+            )
+        except AzureFlowLogError as error:
+            message = str(error)
+            with self._lock:
+                self._source_or_raise(collector_id).azure_flow_log_last_error = message
+            raise ValueError(message) from error
+        except Exception as error:
+            message = (
+                "Azure Virtual Network Flow Log synchronization failed. Check local agent settings."
+            )
+            with self._lock:
+                self._source_or_raise(collector_id).azure_flow_log_last_error = message
+            raise ValueError(message) from error
+        observations = [
+            {
+                "source_vm_uuid": source_vm_uuid_by_ip[item.source_ip],
+                "source_ip": item.source_ip,
+                "destination_ip": item.destination_ip,
+                "destination_port": item.destination_port,
+                "protocol": item.protocol,
+                "collector_type": "azure_vnet_flow_logs",
+                "observed_at": item.observed_at.isoformat(),
+                "process": "azure-vnet-flow-log",
+            }
+            for item in result.observations
+            if item.source_ip in source_vm_uuid_by_ip
+        ]
+        accepted = 0
+        try:
+            for offset in range(0, len(observations), 5_000):
+                accepted += self.upload_observations(
+                    collector_id, observations[offset : offset + 5_000]
+                )["accepted"]
+        except ControlPlaneClientError as error:
+            message = str(error)
+            with self._lock:
+                self._source_or_raise(collector_id).azure_flow_log_last_error = message
+            raise
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            profile.azure_flow_log_object_versions.update(result.processed_object_versions)
+            profile.azure_flow_log_last_sync_at = datetime.now(UTC)
+            profile.azure_flow_log_objects_processed += len(result.processed_object_versions)
+            profile.azure_flow_log_observations_uploaded += accepted
+            profile.azure_flow_log_last_error = None
+        return {
+            "objects_found": result.objects_found,
+            "objects_processed": len(result.processed_object_versions),
+            "observations_uploaded": accepted,
+        }
 
     def configure_aws_credentials(self, request: AwsCredentialsRequest) -> None:
         """Keep AWS authentication configuration in appliance memory only."""
@@ -612,12 +717,19 @@ class AgentRuntime:
                 f"IPFIX is not used by {profile.source_type.title()} sources.",
             )
         aws_flow_log_status, aws_flow_log_detail = self._aws_flow_log_health(profile)
+        azure_flow_log_status, azure_flow_log_detail = self._azure_flow_log_health(profile)
         return {
             "collector_id": profile.identity.collector_id,
             "display_name": profile.display_name,
             "source_type": profile.source_type,
             "vcenter_configured": profile.vcenter_credentials is not None,
             "azure_configured": profile.azure_credentials is not None,
+            "azure_flow_logs_configured": profile.azure_flow_log_settings is not None,
+            "azure_flow_log_status": azure_flow_log_status,
+            "azure_flow_log_detail": azure_flow_log_detail,
+            "azure_flow_log_last_sync_at": self._timestamp(profile.azure_flow_log_last_sync_at),
+            "azure_flow_log_objects_processed": profile.azure_flow_log_objects_processed,
+            "azure_flow_log_observations_uploaded": profile.azure_flow_log_observations_uploaded,
             "aws_configured": profile.aws_credentials is not None,
             "aws_flow_logs_configured": profile.aws_flow_log_settings is not None,
             "aws_flow_log_status": aws_flow_log_status,
@@ -667,6 +779,26 @@ class AgentRuntime:
         if profile.aws_flow_log_observations_uploaded == 0:
             return "Waiting for traffic", "No accepted inventory-matched VPC flows were found yet."
         return "OK", "AWS VPC Flow Log observations are uploading for this source."
+
+    @staticmethod
+    def _azure_flow_log_health(profile: _SourceProfile) -> tuple[str, str]:
+        if profile.source_type != "azure":
+            return "Not applicable", "Virtual Network Flow Logs are used only by Azure sources."
+        if profile.azure_flow_log_settings is None:
+            return (
+                "Not configured",
+                "No Azure Blob Virtual Network Flow Log location is configured.",
+            )
+        if profile.azure_flow_log_last_error:
+            return "Error", profile.azure_flow_log_last_error
+        if profile.azure_flow_log_last_sync_at is None:
+            return "Waiting", "No Virtual Network Flow Log synchronization has completed yet."
+        if profile.azure_flow_log_observations_uploaded == 0:
+            return (
+                "Waiting for traffic",
+                "No accepted inventory-matched Azure flows were found yet.",
+            )
+        return "OK", "Azure Virtual Network Flow Log observations are uploading for this source."
 
     @staticmethod
     def _rejected_exporter_rows(listener: dict[str, object]) -> list[dict[str, object]]:
@@ -742,10 +874,24 @@ class AgentRuntime:
                             self.sync_aws_flow_logs(profile.identity.collector_id)
                         except (ControlPlaneClientError, ValueError):
                             pass
-                    should_sync_inventory = (
-                        profile.last_inventory_sync_at is None
-                        or datetime.now(UTC) - profile.last_inventory_sync_at
-                        >= timedelta(seconds=self._settings.inventory_sync_interval_seconds)
+                    should_sync_azure_flow_logs = (
+                        profile.source_type == "azure"
+                        and profile.azure_flow_log_settings is not None
+                        and (
+                            profile.azure_flow_log_last_sync_at is None
+                            or datetime.now(UTC) - profile.azure_flow_log_last_sync_at
+                            >= timedelta(minutes=5)
+                        )
+                    )
+                    if should_sync_azure_flow_logs:
+                        try:
+                            self.sync_azure_flow_logs(profile.identity.collector_id)
+                        except (ControlPlaneClientError, ValueError):
+                            pass
+                    should_sync_inventory = profile.last_inventory_sync_at is None or datetime.now(
+                        UTC
+                    ) - profile.last_inventory_sync_at >= timedelta(
+                        seconds=self._settings.inventory_sync_interval_seconds
                     )
                     if should_sync_inventory:
                         try:

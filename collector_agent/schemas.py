@@ -51,6 +51,28 @@ class AzureCredentialsRequest(BaseModel):
         return subscriptions
 
 
+class AzureFlowLogSettingsRequest(BaseModel):
+    """Azure Blob location of Virtual Network Flow Logs for an Azure source."""
+
+    collector_id: str = Field(min_length=36, max_length=36)
+    storage_account_name: str = Field(min_length=3, max_length=24, pattern=r"^[a-z0-9]{3,24}$")
+    container_name: str = Field(
+        default="insights-logs-flowlogflowevent",
+        min_length=3,
+        max_length=63,
+        pattern=r"^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])?$",
+    )
+    prefix: str = Field(default="flowLogResourceID=/", min_length=1, max_length=1024)
+
+    @field_validator("prefix")
+    @classmethod
+    def normalized_prefix(cls, value: str) -> str:
+        prefix = value.strip().lstrip("/")
+        if not prefix or ".." in prefix or "\\" in prefix:
+            raise ValueError("Azure Blob prefix must be a non-empty object prefix")
+        return prefix
+
+
 class AwsCredentialsRequest(BaseModel):
     """Local AWS inventory authentication for a selected AWS source."""
 
@@ -95,7 +117,7 @@ class LocalObservation(BaseModel):
     source_ip: str = Field(min_length=3, max_length=45)
     destination_ip: str = Field(min_length=3, max_length=45)
     destination_port: int = Field(ge=1, le=65535)
-    collector_type: str = Field(pattern=r"^(ipfix|guest|aws_vpc_flow_logs)$")
+    collector_type: str = Field(pattern=r"^(ipfix|guest|aws_vpc_flow_logs|azure_vnet_flow_logs)$")
     observed_at: str = Field(min_length=20, max_length=40)
     process: str | None = Field(default=None, max_length=512)
 
