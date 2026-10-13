@@ -48,6 +48,7 @@ from control_plane.schemas import (
     AgentRegistrationResult,
     EnrollmentCreate,
     EnrollmentCreated,
+    InventoryRemovalConfirmation,
     InventoryUpload,
     ObservationUpload,
     ReconnectionCodeCreate,
@@ -56,6 +57,8 @@ from control_plane.schemas import (
 )
 
 _COLLECTOR_OFFLINE_AFTER_SECONDS = 180
+_MATERIAL_REMOVAL_FRACTION = 0.20
+_INVENTORY_REMOVAL_AFTER = timedelta(days=1)
 
 
 class DependencyDecisionPayload(BaseModel):
@@ -286,7 +289,9 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             plan_ids = select(MigrationPlan.id).where(MigrationPlan.collector_id == collector_id)
             deleted = {
                 "migration_plan_dependencies": session.execute(
-                    delete(MigrationPlanDependency).where(MigrationPlanDependency.plan_id.in_(plan_ids))
+                    delete(MigrationPlanDependency).where(
+                        MigrationPlanDependency.plan_id.in_(plan_ids)
+                    )
                 ).rowcount
                 or 0,
                 "migration_plan_vms": session.execute(
@@ -298,7 +303,9 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
                 ).rowcount
                 or 0,
                 "dependency_decisions": session.execute(
-                    delete(DependencyDecision).where(DependencyDecision.collector_id == collector_id)
+                    delete(DependencyDecision).where(
+                        DependencyDecision.collector_id == collector_id
+                    )
                 ).rowcount
                 or 0,
                 "inventory_vm_states": session.execute(
@@ -474,13 +481,36 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         active_vms = session.scalars(
             select(InventoryVm).where(
                 InventoryVm.collector_id == collector.id,
-                InventoryVm.is_active.is_(True),
+                InventoryVm.lifecycle_status.in_(("active", "missing")),
             )
         ).all()
         present_vm_uuids = {item.vm_uuid for item in payload.vms}
+        if not payload.vms and active_vms:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Empty inventory snapshot was blocked; "
+                    "the last trusted inventory was preserved."
+                ),
+            )
         for vm in active_vms:
-            vm.is_active = False
-            if vm.vm_uuid not in present_vm_uuids:
+            if vm.vm_uuid in present_vm_uuids:
+                continue
+            if (
+                vm.lifecycle_status == "missing"
+                and vm.missing_since
+                and now - vm.missing_since >= _INVENTORY_REMOVAL_AFTER
+            ):
+                vm.lifecycle_status = "inactive"
+                vm.is_active = False
+                vm.pending_removal_count += 1
+            else:
+                vm.lifecycle_status = "missing"
+                vm.is_active = False
+                vm.pending_removal_count = max(1, vm.pending_removal_count + 1)
+                vm.missing_since = vm.missing_since or now
+                vm.removal_requires_confirmation = False
+            if vm.lifecycle_status == "inactive":
                 session.add(
                     InventoryVmState(
                         id=str(uuid4()),
@@ -511,6 +541,10 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             vm.os_name = item.os_name
             vm.power_state = item.power_state
             vm.is_active = True
+            vm.lifecycle_status = "active"
+            vm.missing_since = None
+            vm.pending_removal_count = 0
+            vm.removal_requires_confirmation = False
             vm.updated_at = now
             session.add(
                 InventoryVmState(
@@ -532,6 +566,7 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
                 received_at=now,
             )
         )
+        collector.last_successful_inventory_at = now
         try:
             session.commit()
         except IntegrityError:
@@ -550,9 +585,62 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             ) from None
         return UploadResult(accepted=len(payload.vms), duplicate=False)
 
+    @app.post(
+        "/api/v1/dashboard/collectors/{collector_id}/inventory-removals/confirm",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def confirm_inventory_removals(
+        collector_id: str,
+        payload: InventoryRemovalConfirmation,
+        session: Session = Depends(get_session),
+    ) -> dict[str, object]:
+        _require_collector(collector_id, session)
+        vm_uuids = set(payload.vm_uuids)
+        vms = session.scalars(
+            select(InventoryVm).where(
+                InventoryVm.collector_id == collector_id,
+                InventoryVm.vm_uuid.in_(vm_uuids),
+                InventoryVm.lifecycle_status == "pending_removal",
+            )
+        ).all()
+        if len(vms) != len(vm_uuids):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Only pending-removal VMs can be confirmed",
+            )
+        now = _now()
+        for vm in vms:
+            vm.lifecycle_status = "inactive"
+            vm.is_active = False
+            vm.removal_requires_confirmation = False
+            session.add(
+                InventoryVmState(
+                    id=str(uuid4()),
+                    collector_id=collector_id,
+                    vm_uuid=vm.vm_uuid,
+                    name=vm.name,
+                    ips=vm.ips,
+                    power_state=vm.power_state,
+                    is_active=False,
+                    captured_at=now,
+                )
+            )
+        session.commit()
+        return {"status": "confirmed", "vm_count": len(vms), "planner_name": payload.planner_name}
+
     @app.get("/api/v1/dashboard/collectors", dependencies=[Depends(require_dashboard)])
     def list_collectors(session: Session = Depends(get_session)) -> list[dict[str, object]]:
         collectors = session.scalars(select(Collector).order_by(Collector.display_name)).all()
+        # Collectors enrolled before the lifecycle field was introduced can have
+        # a trusted inventory batch but no marker.  The batch timestamp is a
+        # safe read-only fallback for defining the Latest reporting window.
+        latest_batches = dict(
+            session.execute(
+                select(InventoryBatch.collector_id, func.max(InventoryBatch.received_at)).group_by(
+                    InventoryBatch.collector_id
+                )
+            ).all()
+        )
         return [
             {
                 "collector_id": collector.id,
@@ -561,6 +649,11 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
                 "status": _collector_status(collector.last_seen_at),
                 "software_version": collector.software_version,
                 "last_seen_at": collector.last_seen_at.isoformat(),
+                "last_successful_inventory_at": (
+                    (collector.last_successful_inventory_at or latest_batches.get(collector.id)).isoformat()
+                    if collector.last_successful_inventory_at or latest_batches.get(collector.id)
+                    else None
+                ),
             }
             for collector in collectors
         ]
@@ -570,16 +663,56 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         dependencies=[Depends(require_dashboard)],
     )
     def collector_inventory(
-        collector_id: str, session: Session = Depends(get_session)
+        collector_id: str,
+        include_historical: bool = False,
+        historical_as_of: datetime | None = None,
+        session: Session = Depends(get_session),
     ) -> list[dict[str, object]]:
         collector = session.get(Collector, collector_id)
         if collector is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
-        vms = session.scalars(
-            select(InventoryVm)
-            .where(InventoryVm.collector_id == collector_id, InventoryVm.is_active.is_(True))
-            .order_by(InventoryVm.name)
-        ).all()
+        query = select(InventoryVm).where(InventoryVm.collector_id == collector_id)
+        if not include_historical:
+            query = query.where(InventoryVm.is_active.is_(True))
+        vms = session.scalars(query.order_by(InventoryVm.name)).all()
+        if historical_as_of is not None:
+            states = session.scalars(
+                select(InventoryVmState)
+                .where(
+                    InventoryVmState.collector_id == collector_id,
+                    InventoryVmState.captured_at <= historical_as_of,
+                )
+                .order_by(InventoryVmState.captured_at.desc())
+            ).all()
+            latest_by_uuid: dict[str, InventoryVmState] = {}
+            for state in states:
+                latest_by_uuid.setdefault(state.vm_uuid, state)
+            current_by_uuid = {vm.vm_uuid: vm for vm in vms}
+            historical_vms = []
+            for vm_uuid, state in latest_by_uuid.items():
+                current = current_by_uuid.get(vm_uuid)
+                historical_vms.append(
+                    {
+                        "vm_name": state.name,
+                        "vm_uuid": state.vm_uuid,
+                        "hostname": current.hostname if current else None,
+                        "ips": state.ips,
+                        "power_state": state.power_state,
+                        "cluster": current.cluster if current else None,
+                        "folder": current.folder if current else None,
+                        "os_name": current.os_name if current else None,
+                        "is_active": state.is_active,
+                        "lifecycle_status": "historical",
+                        "missing_since": None,
+                        "updated_at": state.captured_at.isoformat(),
+                        "current_is_active": current.is_active if current else False,
+                        "current_power_state": current.power_state if current else None,
+                        "current_lifecycle_status": (
+                            current.lifecycle_status if current else "inactive"
+                        ),
+                    }
+                )
+            return sorted(historical_vms, key=lambda vm: str(vm["vm_name"]))
         return [
             {
                 "vm_name": vm.name,
@@ -590,6 +723,9 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
                 "cluster": vm.cluster,
                 "folder": vm.folder,
                 "os_name": vm.os_name,
+                "is_active": vm.is_active,
+                "lifecycle_status": vm.lifecycle_status,
+                "missing_since": vm.missing_since.isoformat() if vm.missing_since else None,
                 "updated_at": vm.updated_at.isoformat(),
             }
             for vm in vms
@@ -619,7 +755,7 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
     )
     def collector_wave_connections(
         collector_id: str,
-        vm_uuid: list[str] = Query(min_length=1, max_length=250),
+        vm_uuid: list[str] = Query(default=[], max_length=250),
         session: Session = Depends(get_session),
         observed_after: datetime | None = None,
         observed_before: datetime | None = None,
@@ -661,8 +797,13 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             use_approved_plan=use_approved_plan,
         )
 
-    @app.get("/api/v1/dashboard/collectors/{collector_id}/plan-drift", dependencies=[Depends(require_dashboard)])
-    def collector_plan_drift(collector_id: str, session: Session = Depends(get_session)) -> dict[str, object]:
+    @app.get(
+        "/api/v1/dashboard/collectors/{collector_id}/plan-drift",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def collector_plan_drift(
+        collector_id: str, session: Session = Depends(get_session)
+    ) -> dict[str, object]:
         _require_collector(collector_id, session)
         return plan_drift_report(session, collector_id)
 
@@ -751,7 +892,9 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             for item in matching_items
         )
         if not exists:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unknown dependency")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="unknown dependency"
+            )
         decision = session.scalar(
             select(DependencyDecision).where(
                 DependencyDecision.collector_id == collector_id,
@@ -803,9 +946,14 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             "Requires hybrid plan",
         }
         if payload.decision not in allowed_decisions:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid decision")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid decision"
+            )
         note = payload.note.strip() if payload.note and payload.note.strip() else None
-        if payload.decision in {"Confirmed hard dependency", "Not relevant / excluded"} and not note:
+        if (
+            payload.decision in {"Confirmed hard dependency", "Not relevant / excluded"}
+            and not note
+        ):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="a planner note is required for this decision",
@@ -877,7 +1025,9 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             "decision": payload.decision,
         }
 
-    def _plan_response(plan: MigrationPlan, assignments: list[MigrationPlanVm]) -> dict[str, object]:
+    def _plan_response(
+        plan: MigrationPlan, assignments: list[MigrationPlanVm]
+    ) -> dict[str, object]:
         """Serialize plan data without exposing collector credentials or tokens."""
 
         return {
@@ -906,7 +1056,9 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
     def _get_plan(collector_id: str, plan_id: str, session: Session) -> MigrationPlan:
         plan = session.get(MigrationPlan, plan_id)
         if plan is None or plan.collector_id != collector_id:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="migration plan not found")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="migration plan not found"
+            )
         return plan
 
     @app.get(
@@ -951,7 +1103,9 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         assignments = session.scalars(
             select(MigrationPlanVm)
             .where(MigrationPlanVm.plan_id == plan.id)
-            .order_by(MigrationPlanVm.disposition, MigrationPlanVm.wave_number, MigrationPlanVm.vm_name)
+            .order_by(
+                MigrationPlanVm.disposition, MigrationPlanVm.wave_number, MigrationPlanVm.vm_name
+            )
         ).all()
         return _plan_response(plan, assignments)
 
@@ -986,7 +1140,9 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
                 detail="no eligible powered-on VMs are available for a migration plan",
             )
         current_version = session.scalar(
-            select(func.max(MigrationPlan.version)).where(MigrationPlan.collector_id == collector_id)
+            select(func.max(MigrationPlan.version)).where(
+                MigrationPlan.collector_id == collector_id
+            )
         )
         now = _now()
         plan = MigrationPlan(
@@ -1001,9 +1157,7 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         )
         assignments: list[MigrationPlanVm] = []
         for wave in recommended_waves:
-            for vm_uuid, vm_name in zip(
-                wave["server_vm_uuids"], wave["server_names"], strict=True
-            ):
+            for vm_uuid, vm_name in zip(wave["server_vm_uuids"], wave["server_names"], strict=True):
                 assignments.append(
                     MigrationPlanVm(
                         id=str(uuid4()),
@@ -1043,25 +1197,38 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
                 MigrationPlan.collector_id == collector_id, MigrationPlan.status == "draft"
             )
         ):
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="a draft plan already exists")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="a draft plan already exists"
+            )
         source_assignments = session.scalars(
             select(MigrationPlanVm).where(MigrationPlanVm.plan_id == source.id)
         ).all()
         current_version = session.scalar(
-            select(func.max(MigrationPlan.version)).where(MigrationPlan.collector_id == collector_id)
+            select(func.max(MigrationPlan.version)).where(
+                MigrationPlan.collector_id == collector_id
+            )
         )
         now = _now()
         plan = MigrationPlan(
-            id=str(uuid4()), collector_id=collector_id, version=(current_version or 0) + 1,
-            status="draft", planner_name=payload.planner_name.strip(),
+            id=str(uuid4()),
+            collector_id=collector_id,
+            version=(current_version or 0) + 1,
+            status="draft",
+            planner_name=payload.planner_name.strip(),
             note=payload.note.strip() if payload.note and payload.note.strip() else None,
-            created_at=now, updated_at=now,
+            created_at=now,
+            updated_at=now,
         )
         assignments = [
             MigrationPlanVm(
-                id=str(uuid4()), plan_id=plan.id, vm_uuid=item.vm_uuid, vm_name=item.vm_name,
+                id=str(uuid4()),
+                plan_id=plan.id,
+                vm_uuid=item.vm_uuid,
+                vm_name=item.vm_name,
                 recommended_wave_number=item.recommended_wave_number,
-                wave_number=item.wave_number, disposition=item.disposition, note=item.note,
+                wave_number=item.wave_number,
+                disposition=item.disposition,
+                note=item.note,
             )
             for item in source_assignments
         ]
@@ -1083,18 +1250,27 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         _require_collector(collector_id, session)
         plan = _get_plan(collector_id, plan_id, session)
         if plan.status != "draft":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="approved plans are read-only")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="approved plans are read-only"
+            )
         if payload.disposition not in {"included", "excluded"}:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid disposition")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid disposition"
+            )
         if payload.disposition == "included" and payload.wave_number is None:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="included VMs need a wave number")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="included VMs need a wave number",
+            )
         assignment = session.scalar(
             select(MigrationPlanVm).where(
                 MigrationPlanVm.plan_id == plan.id, MigrationPlanVm.vm_uuid == payload.vm_uuid
             )
         )
         if assignment is None:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="VM is not in this plan")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="VM is not in this plan"
+            )
         assignment.disposition = payload.disposition
         assignment.wave_number = payload.wave_number if payload.disposition == "included" else None
         assignment.note = payload.note.strip() if payload.note and payload.note.strip() else None
@@ -1115,25 +1291,41 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         _require_collector(collector_id, session)
         plan = _get_plan(collector_id, plan_id, session)
         if plan.status != "draft":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="approved plans are read-only")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="approved plans are read-only"
+            )
         if payload.disposition not in {"included", "excluded"}:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid disposition")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid disposition"
+            )
         if payload.disposition == "included" and payload.wave_number is None:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="included VMs need a wave number")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="included VMs need a wave number",
+            )
         unique_vm_uuids = set(payload.vm_uuids)
         if len(unique_vm_uuids) != len(payload.vm_uuids):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="duplicate VM selection")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="duplicate VM selection"
+            )
         assignments = session.scalars(
             select(MigrationPlanVm).where(
                 MigrationPlanVm.plan_id == plan.id, MigrationPlanVm.vm_uuid.in_(unique_vm_uuids)
             )
         ).all()
         if len(assignments) != len(unique_vm_uuids):
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="one or more VMs are not in this plan")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="one or more VMs are not in this plan",
+            )
         for assignment in assignments:
             assignment.disposition = payload.disposition
-            assignment.wave_number = payload.wave_number if payload.disposition == "included" else None
-            assignment.note = payload.note.strip() if payload.note and payload.note.strip() else None
+            assignment.wave_number = (
+                payload.wave_number if payload.disposition == "included" else None
+            )
+            assignment.note = (
+                payload.note.strip() if payload.note and payload.note.strip() else None
+            )
         plan.updated_at = _now()
         session.commit()
         return {"status": "saved", "plan_id": plan.id, "vm_count": len(assignments)}
@@ -1151,14 +1343,19 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         _require_collector(collector_id, session)
         plan = _get_plan(collector_id, plan_id, session)
         if plan.status != "draft":
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="only a draft plan can be approved")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="only a draft plan can be approved"
+            )
         included_count = session.scalar(
             select(func.count(MigrationPlanVm.id)).where(
                 MigrationPlanVm.plan_id == plan.id, MigrationPlanVm.disposition == "included"
             )
         )
         if not included_count:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="a plan needs at least one included VM")
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="a plan needs at least one included VM",
+            )
         now = _now()
         session.execute(
             update(MigrationPlan)
@@ -1220,6 +1417,7 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         observed_after: datetime | None = None,
         observed_before: datetime | None = None,
         use_approved_plan: bool = True,
+        historical: bool = False,
     ) -> list[dict[str, object]]:
         _require_collector(collector_id, session)
         return migration_waves(
@@ -1228,6 +1426,7 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             observed_after,
             observed_before,
             use_approved_plan=use_approved_plan,
+            historical=historical,
         )
 
     @app.get(
@@ -1240,6 +1439,7 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         observed_after: datetime | None = None,
         observed_before: datetime | None = None,
         use_approved_plan: bool = True,
+        historical: bool = False,
     ) -> dict[str, int]:
         _require_collector(collector_id, session)
         return wave_summary(
@@ -1248,6 +1448,7 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             observed_after,
             observed_before,
             use_approved_plan=use_approved_plan,
+            historical=historical,
         )
 
     return app

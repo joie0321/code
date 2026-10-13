@@ -424,6 +424,7 @@ def _dependency_map_graph(
     displayed_vm_uuids: set[str],
     focus_vm_uuid: str | None = None,
     zoom_percent: int = 100,
+    current_status_by_uuid: dict[str, str] | None = None,
 ) -> str:
     """Build a compact discovery map with external endpoints collapsed to one node."""
 
@@ -478,14 +479,37 @@ def _dependency_map_graph(
         ),
     ]
     for vm_uuid, node_id in node_ids.items():
-        label = _escape_dot(_compact_graph_label(names_by_uuid.get(vm_uuid, vm_uuid), 16))
-        if vm_uuid == focus_vm_uuid:
-            lines.append(
-                f'{node_id} [label="{label}", color="#2563eb", fillcolor="#dbeafe", '
-                'penwidth=2.0];'
+        name = names_by_uuid.get(vm_uuid, vm_uuid)
+        current_status = (current_status_by_uuid or {}).get(vm_uuid, "active and powered on")
+        label = _escape_dot(_compact_graph_label(name, 16))
+        tooltip = _escape_dot(f"{name}\nCurrent status: {current_status}")
+        attributes: list[str] = [f'tooltip="{tooltip}"']
+        if current_status == "powered off":
+            label = f"⚠ {label}"
+            attributes.extend(
+                [
+                    'style="rounded,dashed,filled"',
+                    'color="#c2410c"',
+                    'fillcolor="#ffedd5"',
+                    'fontcolor="#7c2d12"',
+                ]
             )
-        else:
-            lines.append(f'{node_id} [label="{label}"];')
+        elif current_status == "removed from inventory":
+            label = f"⚠ {label}"
+            attributes.extend(
+                [
+                    'style="rounded,dashed,filled"',
+                    'color="#b91c1c"',
+                    'fillcolor="#fee2e2"',
+                    'fontcolor="#7f1d1d"',
+                ]
+            )
+        elif vm_uuid == focus_vm_uuid:
+            attributes.extend(['color="#2563eb"', 'fillcolor="#dbeafe"'])
+        if vm_uuid == focus_vm_uuid:
+            attributes.append('penwidth=2.0')
+        attributes.insert(0, f'label="{label}"')
+        lines.append(f"{node_id} [{', '.join(attributes)}];")
     if external_destinations:
         lines.append(
             'external_endpoints [label="External endpoints\\n'
@@ -534,10 +558,35 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
     selected_label = _remembered_selectbox(
         "Collector", options, "current_environment_collector"
     )
-    observed_after, observed_before, range_label = _observation_window("current_environment")
     collector_id = options[selected_label]
+    data_view = st.radio(
+        "Environment view",
+        ("Latest", "Historical period"),
+        horizontal=True,
+        key="current_environment_view",
+        help=(
+            "Latest starts traffic reporting at the latest successful inventory sync. "
+            "Historical period reconstructs waves from retained evidence in the selected window."
+        ),
+    )
+    selected_collector = next(item for item in collectors if item["collector_id"] == collector_id)
+    historical = data_view == "Historical period"
+    if historical:
+        observed_after, observed_before, range_label = _observation_window("current_environment")
+    else:
+        latest_inventory_at = selected_collector.get("last_successful_inventory_at")
+        if not isinstance(latest_inventory_at, str):
+            st.warning("No successful inventory sync is recorded yet; Latest traffic cannot be calculated.")
+            return
+        observed_after = datetime.fromisoformat(latest_inventory_at)
+        observed_before = datetime.now(UTC)
+        range_label = f"Since latest inventory sync ({latest_inventory_at})"
     try:
-        inventory = client.inventory(collector_id)
+        inventory = client.inventory(
+            collector_id,
+            include_historical=historical,
+            historical_as_of=observed_before.isoformat() if historical else None,
+        )
         connections = client.connections(
             collector_id, observed_after.isoformat(), observed_before.isoformat()
         )
@@ -546,20 +595,22 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
             observed_after.isoformat(),
             observed_before.isoformat(),
             use_approved_plan=False,
+            historical=historical,
         )
         summary = client.wave_summary(
             collector_id,
             observed_after.isoformat(),
             observed_before.isoformat(),
             use_approved_plan=False,
+            historical=historical,
         )
     except DashboardClientError as error:
         st.error(str(error))
         return
 
     st.caption(
-        f"Observed traffic window: {range_label}. Recommended waves use the current "
-        "automatic recommendation. Graphs include at most 100 unique edges."
+        f"Observed traffic window: {range_label}. {'Historical' if historical else 'Latest'} "
+        "waves use automatic discovery only. Graphs include at most 100 unique edges."
     )
 
     inventory_vm_uuids = {
@@ -570,6 +621,19 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
         for item in inventory
         if isinstance(item.get("vm_uuid"), str)
     }
+    current_status_by_uuid = {
+        str(item["vm_uuid"]): (
+            "removed from inventory"
+            if not item.get("current_is_active", item.get("is_active"))
+            else (
+                "powered off"
+                if item.get("current_power_state", item.get("power_state")) != "poweredOn"
+                else "active and powered on"
+            )
+        )
+        for item in inventory
+        if isinstance(item.get("vm_uuid"), str)
+    }
     observed_vm_uuids = set().union(
         *(_connection_vm_uuids(item) for item in connections),
     ) if connections else set()
@@ -577,7 +641,7 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
     st.markdown("#### VM estate")
     estate_cards = st.columns(5)
     estate_values = (
-        ("Active inventory VMs", len(inventory)),
+        (("Historical inventory VMs" if historical else "Latest inventory VMs"), len(inventory)),
         ("Powered-on VMs", sum(item.get("power_state") == "poweredOn" for item in inventory)),
         ("Powered-off VMs", sum(item.get("power_state") == "poweredOff" for item in inventory)),
         ("VMs with observed traffic", len(observed_inventory_vm_uuids)),
@@ -619,7 +683,6 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
     zoom_percent = _remembered_slider(
         "Graph zoom", 70, 200, 100, "current_environment_graph_zoom"
     )
-    connection_scope_vm_uuids: list[str] = []
     connection_scope_label = ""
     if map_view == "Recommended wave":
         if not waves:
@@ -636,7 +699,6 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
             selected_vm_uuids = {
                 str(vm_uuid) for vm_uuid in selected_wave["server_vm_uuids"]
             }
-            connection_scope_vm_uuids = list(selected_vm_uuids)
             connection_scope_label = selected_wave_label
             st.caption(str(selected_wave.get("reason", "Automatic recommendation.")))
             st.caption(
@@ -649,6 +711,7 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
                     connections,
                     selected_vm_uuids,
                     zoom_percent=zoom_percent,
+                    current_status_by_uuid=current_status_by_uuid,
                 ),
                 width="content",
             )
@@ -660,7 +723,6 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
             "Focus VM", focus_options, "current_environment_focus_vm"
         )
         focus_vm_uuid = focus_options[focus_label]
-        connection_scope_vm_uuids = [focus_vm_uuid]
         connection_scope_label = focus_label
         focused_connections = [
             item
@@ -683,6 +745,7 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
                 displayed_vm_uuids,
                 focus_vm_uuid=focus_vm_uuid,
                 zoom_percent=zoom_percent,
+                current_status_by_uuid=current_status_by_uuid,
             ),
             width="content",
         )
@@ -694,21 +757,37 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
         if connection_scope_label
         else "#### Current inventory"
     )
+    display_vm_uuids: list[str] = []
+
     inventory_search = st.text_input(
         "Filter inventory by VM name, IP, cluster, folder, or operating system",
         key="current_environment_inventory_search",
     ).casefold().strip()
-    scoped_inventory = [
-        item
-        for item in inventory
-        if str(item.get("vm_uuid", "")) in connection_scope_vm_uuids
-    ]
+    scoped_inventory = (
+        [
+            item
+            for item in inventory
+            if str(item.get("vm_uuid", "")) in display_vm_uuids
+        ]
+        if display_vm_uuids
+        else inventory
+    )
     inventory_rows = [
         {
             "VM": item.get("vm_name", ""),
             "Hostname": item.get("hostname", ""),
             "IP addresses": item.get("ips", ""),
             "Power state": item.get("power_state", ""),
+            "Inventory status": (
+                "Current"
+                if item.get("current_is_active", item.get("is_active"))
+                else (
+                    "Missing from latest inventory"
+                    if item.get("current_lifecycle_status", item.get("lifecycle_status"))
+                    == "missing"
+                    else "Removed from current inventory"
+                )
+            ),
             "Cluster": item.get("cluster", ""),
             "Folder": item.get("folder", ""),
             "Operating system": item.get("os_name", ""),
@@ -727,13 +806,9 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
     if inventory_rows:
         st.dataframe(inventory_rows, width="stretch", hide_index=True)
     else:
-        st.info("No inventory VMs match the selected wave or focused VM.")
+        st.info("No retained inventory VMs match the selected wave or focused VM.")
 
     st.markdown("#### Current observed connections")
-    if not connection_scope_vm_uuids:
-        st.info("Select a recommended wave or focused VM to view its observed connections.")
-        return
-
     page_state_key = (
         f"current_environment_connection_page_{collector_id}_{map_view}_{connection_scope_label}"
     )
@@ -741,7 +816,7 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
     try:
         scoped_connection_page = client.wave_connections(
             collector_id,
-            connection_scope_vm_uuids,
+            display_vm_uuids,
             observed_after.isoformat(),
             observed_before.isoformat(),
             st.session_state[page_state_key],
@@ -756,7 +831,7 @@ def render_current_environment(collectors: list[dict[str, object]]) -> None:
     total_connections = scoped_connection_page["total"]
     current_page = scoped_connection_page["page"]
     page_size = scoped_connection_page["page_size"]
-    st.caption(f"Showing {total_connections} unique connection(s) for {connection_scope_label}.")
+    st.caption(f"Showing {total_connections} unique connection(s) for the selected {data_view.casefold()}.")
     connection_search = st.text_input(
         "Filter connections by source, destination, IP, protocol, or port",
         key="current_environment_connection_search",

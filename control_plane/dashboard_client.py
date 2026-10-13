@@ -25,8 +25,21 @@ class ControlPlaneDashboardClient:
             raise DashboardClientError("Control plane returned an invalid collector response")
         return response
 
-    def inventory(self, collector_id: str) -> list[dict[str, Any]]:
-        response = self._get(f"/api/v1/dashboard/collectors/{collector_id}/inventory")
+    def inventory(
+        self,
+        collector_id: str,
+        include_historical: bool = False,
+        historical_as_of: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query: dict[str, Any] = {"include_historical": include_historical}
+        if historical_as_of is not None:
+            query["historical_as_of"] = historical_as_of
+        response = self._get(
+            self._with_query(
+                f"/api/v1/dashboard/collectors/{collector_id}/inventory",
+                query,
+            )
+        )
         if not isinstance(response, list):
             raise DashboardClientError("Control plane returned an invalid inventory response")
         return response
@@ -131,6 +144,7 @@ class ControlPlaneDashboardClient:
         observed_after: str,
         observed_before: str,
         use_approved_plan: bool = True,
+        historical: bool = False,
     ) -> list[dict[str, Any]]:
         response = self._get(
             self._with_query(
@@ -139,6 +153,7 @@ class ControlPlaneDashboardClient:
                     "observed_after": observed_after,
                     "observed_before": observed_before,
                     "use_approved_plan": use_approved_plan,
+                    "historical": historical,
                 },
             )
         )
@@ -235,6 +250,7 @@ class ControlPlaneDashboardClient:
         observed_after: str,
         observed_before: str,
         use_approved_plan: bool = True,
+        historical: bool = False,
     ) -> dict[str, Any]:
         response = self._get(
             self._with_query(
@@ -243,6 +259,7 @@ class ControlPlaneDashboardClient:
                     "observed_after": observed_after,
                     "observed_before": observed_before,
                     "use_approved_plan": use_approved_plan,
+                    "historical": historical,
                 },
             )
         )

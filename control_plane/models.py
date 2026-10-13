@@ -49,6 +49,9 @@ class Collector(Base):
     status: Mapped[str] = mapped_column(String(16), default="online", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    last_successful_inventory_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class ObservationBatch(Base):
@@ -111,6 +114,10 @@ class InventoryVm(Base):
     os_name: Mapped[str | None] = mapped_column(String(512), nullable=True)
     power_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    lifecycle_status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    missing_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pending_removal_count: Mapped[int] = mapped_column(Integer, default=0)
+    removal_requires_confirmation: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
 
 
@@ -161,7 +168,9 @@ class MigrationPlan(Base):
     """A versioned, planner-owned migration plan for one collector."""
 
     __tablename__ = "migration_plans"
-    __table_args__ = (UniqueConstraint("collector_id", "version", name="uq_migration_plan_version"),)
+    __table_args__ = (
+        UniqueConstraint("collector_id", "version", name="uq_migration_plan_version"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     collector_id: Mapped[str] = mapped_column(ForeignKey("collectors.id"), index=True)

@@ -105,3 +105,9 @@ class InventoryVmIn(BaseModel):
 class InventoryUpload(BaseModel):
     sequence: int = Field(ge=1)
     vms: list[InventoryVmIn] = Field(max_length=100_000)
+
+
+class InventoryRemovalConfirmation(BaseModel):
+    vm_uuids: list[str] = Field(min_length=1, max_length=100_000)
+    planner_name: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9 ._-]+$")
+    note: str | None = Field(default=None, max_length=2000)

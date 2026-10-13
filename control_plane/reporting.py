@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy import func, or_, select
@@ -12,6 +13,7 @@ from control_plane.models import (
     Collector,
     DependencyDecision,
     InventoryVm,
+    InventoryVmState,
     MigrationPlan,
     MigrationPlanDependency,
     MigrationPlanVm,
@@ -89,7 +91,89 @@ def _inventory(session: Session, collector_id: str) -> list[InventoryVm]:
     ).all()
 
 
-def _eligible_vms(vms: list[InventoryVm]) -> list[InventoryVm]:
+@dataclass(frozen=True)
+class _HistoricalInventoryVm:
+    """Inventory identity and eligibility state captured at a historical point in time."""
+
+    vm_uuid: str
+    name: str
+    ips: str
+    power_state: str | None
+    is_active: bool
+
+
+def _historical_inventory(
+    session: Session,
+    collector_id: str,
+    as_of: datetime | None,
+    observed_after: datetime | None = None,
+) -> list[_HistoricalInventoryVm | InventoryVm]:
+    """Return each VM's state while the selected historical period was active."""
+
+    state_query = select(InventoryVmState).where(InventoryVmState.collector_id == collector_id)
+    if as_of is not None:
+        state_query = state_query.where(InventoryVmState.captured_at <= _utc_naive(as_of))
+    states = session.scalars(
+        state_query.order_by(InventoryVmState.captured_at.desc())
+    ).all()
+    latest_by_uuid: dict[str, InventoryVmState] = {}
+    active_in_window_by_uuid: dict[str, InventoryVmState] = {}
+    window_start = _utc_naive(observed_after)
+    for state in states:
+        latest_by_uuid.setdefault(state.vm_uuid, state)
+        captured_at = _utc_naive(state.captured_at)
+        if (
+            state.is_active
+            and (state.power_state or "").casefold() == "poweredon"
+            and (window_start is None or (captured_at is not None and captured_at >= window_start))
+        ):
+            # Rows are newest first, so this is the VM's final known eligible
+            # state during the selected period.
+            active_in_window_by_uuid.setdefault(state.vm_uuid, state)
+    if not latest_by_uuid:
+        # State-history collection was introduced after early deployments. Use
+        # only identities proved by observations in this period; projecting every
+        # retained VM backwards would make VMs appear before they were created.
+        observations = _observations(session, collector_id, observed_after, as_of)
+        observed_vm_uuids = {
+            observation.source_vm_uuid
+            for observation in observations
+        }
+        observed_ips = {
+            endpoint
+            for observation in observations
+            for endpoint in (observation.source_ip, observation.destination_ip)
+        }
+        return [
+            _HistoricalInventoryVm(
+                vm_uuid=vm.vm_uuid,
+                name=vm.name,
+                ips=vm.ips,
+                power_state="poweredOn",
+                is_active=True,
+            )
+            for vm in _inventory(session, collector_id)
+            if vm.vm_uuid in observed_vm_uuids
+            or any(ip in observed_ips for ip in vm.ips.split(",") if ip)
+        ]
+    historical_vms: list[_HistoricalInventoryVm] = []
+    for vm_uuid, latest_state in latest_by_uuid.items():
+        state = active_in_window_by_uuid.get(vm_uuid, latest_state)
+        historical_vms.append(
+            _HistoricalInventoryVm(
+                vm_uuid=state.vm_uuid,
+                name=state.name,
+                ips=state.ips,
+                power_state=state.power_state,
+                is_active=state.is_active,
+            )
+        )
+    return historical_vms
+
+
+def _eligible_vms(
+    vms: list[InventoryVm | _HistoricalInventoryVm],
+) -> list[InventoryVm | _HistoricalInventoryVm]:
     return [
         vm
         for vm in vms
@@ -178,7 +262,7 @@ def wave_connection_report(
     deduplicate: bool = False,
     exclude_dynamic_private_ports: bool = False,
 ) -> dict[str, object]:
-    """Return one bounded page of evidence for the selected wave VMs.
+    """Return one bounded page of evidence for selected VMs or all retained VMs.
 
     Filtering happens in the database before pagination.  This prevents a busy
     collector's newest global observations from hiding older evidence for a
@@ -188,7 +272,11 @@ def wave_connection_report(
 
     selected_vm_uuids = set(vm_uuids)
     inventory = _inventory(session, collector_id)
-    selected_vms = [vm for vm in inventory if vm.vm_uuid in selected_vm_uuids]
+    selected_vms = (
+        [vm for vm in inventory if vm.vm_uuid in selected_vm_uuids]
+        if selected_vm_uuids
+        else inventory
+    )
     selected_vm_uuids = {vm.vm_uuid for vm in selected_vms}
     selected_ips = {ip for vm in selected_vms for ip in vm.ips.split(",") if ip}
     if not selected_vm_uuids:
@@ -540,10 +628,11 @@ def migration_waves(
     observed_after: datetime | None = None,
     observed_before: datetime | None = None,
     use_approved_plan: bool = True,
+    historical: bool = False,
 ) -> list[dict[str, object]]:
-    """Build waves from connected active, powered-on VMs in one collector inventory."""
+    """Build current or historical waves from collector-local evidence."""
 
-    if use_approved_plan:
+    if use_approved_plan and not historical:
         approved_plan = session.scalar(
             select(MigrationPlan)
             .where(
@@ -580,7 +669,11 @@ def migration_waves(
                 for wave_number, members in sorted(by_wave.items())
             ]
 
-    inventory = _inventory(session, collector_id)
+    inventory = (
+        _historical_inventory(session, collector_id, observed_before, observed_after)
+        if historical
+        else _inventory(session, collector_id)
+    )
     eligible = _eligible_vms(inventory)
     names_by_uuid = {vm.vm_uuid: vm.name for vm in eligible}
     inventory_by_uuid = {vm.vm_uuid: vm for vm in inventory}
@@ -678,8 +771,13 @@ def wave_summary(
     observed_after: datetime | None = None,
     observed_before: datetime | None = None,
     use_approved_plan: bool = True,
+    historical: bool = False,
 ) -> dict[str, int]:
-    inventory = _active_inventory(session, collector_id)
+    inventory = (
+        _historical_inventory(session, collector_id, observed_before, observed_after)
+        if historical
+        else _active_inventory(session, collector_id)
+    )
     eligible = _eligible_vms(inventory)
     eligible_uuids = {vm.vm_uuid for vm in eligible}
     eligible_by_ip = {ip: vm.vm_uuid for vm in eligible for ip in vm.ips.split(",") if ip}
@@ -698,6 +796,7 @@ def wave_summary(
         observed_after,
         observed_before,
         use_approved_plan=use_approved_plan,
+        historical=historical,
     )
     # A migration wave has a connection only when it contains an internal
     # VM-to-VM TCP edge.  A VM may have TCP observations to an external IP,
