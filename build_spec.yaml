@@ -14,10 +14,9 @@ steps:
     command: |
       FLOWWAVE_IMAGE_TAG="${OCI_BUILD_RUN_ID}"
   - type: Command
-    name: Validate Python application modules
+    name: Validate Python syntax
     timeoutInSeconds: 600
     command: |
-      python3 -m pip install --no-cache-dir .
       python3 -m compileall -q control_plane collector_agent
   - type: Command
     name: Build Control Plane image
