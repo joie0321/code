@@ -1,0 +1,12 @@
+{
+  "items": [
+    {
+      "artifactId": "ocid1.devopsdeployartifact.oc1.ap-sydney-1.amaaaaaakwetmsaaux6t3wwumnty65tqtjbzpz7dp6b5hptaysxlfbcvxsva",
+      "artifactName": "flowwave-control-image"
+    },
+    {
+      "artifactId": "ocid1.devopsdeployartifact.oc1.ap-sydney-1.amaaaaaakwetmsaad6jq5cidddjt2fe7m6ifcmwdib6g3z25f4jpvnyhmu7q",
+      "artifactName": "flowwave-collector-image"
+    }
+  ]
+}

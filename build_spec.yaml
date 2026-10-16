@@ -2,8 +2,17 @@ version: 0.1
 component: build
 timeoutInSeconds: 1800
 shell: bash
+failImmediatelyOnError: true
+
+env:
+  exportedVariables:
+    - FLOWWAVE_IMAGE_TAG
 
 steps:
+  - type: Command
+    name: Set image version
+    command: |
+      FLOWWAVE_IMAGE_TAG="${OCI_BUILD_RUN_ID}"
   - type: Command
     name: Validate Python application modules
     timeoutInSeconds: 600
