@@ -1,0 +1,9 @@
+{
+  "compartmentId": "ocid1.compartment.oc1..aaaaaaaaql36aenq3xp66czppan35kzu4gw3o6tkchlghzc37hssiqzzg32a",
+  "source": {
+    "category": "all",
+    "resource": "ocid1.devopsproject.oc1.ap-sydney-1.amaaaaaakwetmsaaj7bu4fq7yakfxck3gjbz4ahaydsvpmqbqysklsmy6hna",
+    "service": "devops",
+    "sourceType": "OCISERVICE"
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "items": [
+    {
+      "name": "flowwave-source",
+      "branch": "master",
+      "connectionType": "DEVOPS_CODE_REPOSITORY",
+      "repositoryId": "ocid1.devopsrepository.oc1.ap-sydney-1.amaaaaaakwetmsaauqq756cbwx5qipjh7eaxweojrr3uxmm3mgje6zfsqdua",
+      "repositoryUrl": "https://devops.scmservice.ap-sydney-1.oci.oraclecloud.com/namespaces/idjhqglymefr/projects/flowwave-dev/repositories/flowwave"
+    }
+  ]
+}
