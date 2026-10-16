@@ -1,0 +1,24 @@
+# Runtime configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Python and JavaScript build artifacts
+.venv/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.npm-cache/
+**/node_modules/
+**/dist/
+
+# Runtime state and diagnostics
+**/collector_sequence_state.json
+*.db
+*.log
+
+# Local archives and test outputs
+backups/
+tests/
+*.zip

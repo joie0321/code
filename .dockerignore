@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+.git
+.pytest_cache
+.ruff_cache
+.npm-cache
+**/__pycache__
+**/*.py[cod]
+**/node_modules
+**/dist
+**/*.db
+**/collector_sequence_state.json
+tests
+backups
+*.zip
+*.log

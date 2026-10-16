@@ -1,0 +1,30 @@
+[
+  {
+    "description": "Private FlowWave Collector UI from OCVS_SYD",
+    "direction": "INGRESS",
+    "isStateless": false,
+    "protocol": "6",
+    "source": "10.7.0.0/16",
+    "sourceType": "CIDR_BLOCK",
+    "tcpOptions": {
+      "destinationPortRange": {
+        "min": 8502,
+        "max": 8502
+      }
+    }
+  },
+  {
+    "description": "IPFIX exporters from OCVS_SYD",
+    "direction": "INGRESS",
+    "isStateless": false,
+    "protocol": "17",
+    "source": "10.7.0.0/16",
+    "sourceType": "CIDR_BLOCK",
+    "udpOptions": {
+      "destinationPortRange": {
+        "min": 4739,
+        "max": 4739
+      }
+    }
+  }
+]

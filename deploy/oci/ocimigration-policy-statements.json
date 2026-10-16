@@ -1,0 +1,7 @@
+[
+  "Allow dynamic-group ocimigration-dg to read secret-bundles in compartment OCVS where target.secret.id = 'ocid1.vaultsecret.oc1.ap-sydney-1.amaaaaaakwetmsaazttjekyk6rd6yctx7xxszkkdafhfeeokymzzztwkmsbq'",
+  "Allow dynamic-group ocimigration-dg to read secret-bundles in compartment OCVS where all {request.principal.type = 'computecontainerinstance', target.secret.id = 'ocid1.vaultsecret.oc1.ap-sydney-1.amaaaaaakwetmsaazttjekyk6rd6yctx7xxszkkdafhfeeokymzzztwkmsbq'}",
+  "Allow dynamic-group ocimigration-dg to read secret-bundles in compartment OCVS where all {request.principal.type = 'computecontainerinstance', target.secret.id = 'ocid1.vaultsecret.oc1.ap-sydney-1.amaaaaaakwetmsaarlcrmbnubbus7tqqjneietpft763f6sh4rkhq3ksaztq'}",
+  "Allow dynamic-group ocimigration-dg to read secret-bundles in compartment OCVS where all {request.principal.type = 'computecontainerinstance', target.secret.id = 'ocid1.vaultsecret.oc1.ap-sydney-1.amaaaaaakwetmsaahzz7byw7kum6z5d7e34anxe4qg6qinjnjqioy67aiuxq'}",
+  "Allow dynamic-group ocimigration-dg to read repos in compartment id ocid1.compartment.oc1..aaaaaaaaql36aenq3xp66czppan35kzu4gw3o6tkchlghzc37hssiqzzg32a"
+]

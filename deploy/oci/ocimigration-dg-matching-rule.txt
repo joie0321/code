@@ -1,0 +1,1 @@
+Any {All {resource.type = 'instance', resource.id = 'ocid1.instance.oc1.ap-sydney-1.anzxsljrkwetmsacdj6igb4uy566ozfaiqsabrh4tp5jkxuu75lbs6vwxpzq'}, All {resource.type = 'computecontainerinstance', resource.compartment.id = 'ocid1.compartment.oc1..aaaaaaaaql36aenq3xp66czppan35kzu4gw3o6tkchlghzc37hssiqzzg32a'}}

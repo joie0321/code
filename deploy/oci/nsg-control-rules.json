@@ -1,0 +1,30 @@
+[
+  {
+    "description": "Private FlowWave Control API from OCVS_SYD",
+    "direction": "INGRESS",
+    "isStateless": false,
+    "protocol": "6",
+    "source": "10.7.0.0/16",
+    "sourceType": "CIDR_BLOCK",
+    "tcpOptions": {
+      "destinationPortRange": {
+        "min": 8100,
+        "max": 8100
+      }
+    }
+  },
+  {
+    "description": "Private FlowWave Control UI from OCVS_SYD",
+    "direction": "INGRESS",
+    "isStateless": false,
+    "protocol": "6",
+    "source": "10.7.0.0/16",
+    "sourceType": "CIDR_BLOCK",
+    "tcpOptions": {
+      "destinationPortRange": {
+        "min": 8503,
+        "max": 8503
+      }
+    }
+  }
+]

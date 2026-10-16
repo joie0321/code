@@ -1,0 +1,30 @@
+version: 0.1
+component: build
+timeoutInSeconds: 1800
+shell: bash
+
+steps:
+  - type: Command
+    name: Validate Python application modules
+    timeoutInSeconds: 600
+    command: |
+      python3 -m pip install --no-cache-dir .
+      python3 -m compileall -q control_plane collector_agent
+  - type: Command
+    name: Build Control Plane image
+    timeoutInSeconds: 600
+    command: |
+      docker build --pull --file Dockerfile.control --tag flowwave-control:${OCI_BUILD_RUN_ID} .
+  - type: Command
+    name: Build Collector image
+    timeoutInSeconds: 600
+    command: |
+      docker build --pull --file Dockerfile.collector --tag flowwave-collector:${OCI_BUILD_RUN_ID} .
+
+outputArtifacts:
+  - name: flowwave-control-image
+    type: DOCKER_IMAGE
+    location: flowwave-control:${OCI_BUILD_RUN_ID}
+  - name: flowwave-collector-image
+    type: DOCKER_IMAGE
+    location: flowwave-collector:${OCI_BUILD_RUN_ID}
