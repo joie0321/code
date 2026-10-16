@@ -14,12 +14,12 @@ steps:
     name: Build Control Plane image
     timeoutInSeconds: 600
     command: |
-      docker build --pull --file Dockerfile.control --tag flowwave-control:${OCI_BUILD_RUN_ID} .
+      podman build --pull --file Dockerfile.control --tag flowwave-control:${OCI_BUILD_RUN_ID} .
   - type: Command
     name: Build Collector image
     timeoutInSeconds: 600
     command: |
-      docker build --pull --file Dockerfile.collector --tag flowwave-collector:${OCI_BUILD_RUN_ID} .
+      podman build --pull --file Dockerfile.collector --tag flowwave-collector:${OCI_BUILD_RUN_ID} .
 
 outputArtifacts:
   - name: flowwave-control-image
