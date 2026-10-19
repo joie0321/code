@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Run the local Collector API/agent and its browser-facing UI as one
+# application unit.  The Collector API remains loopback-only; the UI is its
+# only local client and the IPFIX listener is managed by the Collector runtime.
+set -uo pipefail
+
+children=()
+
+shutdown() {
+  trap - TERM INT
+  kill -TERM "${children[@]}" 2>/dev/null || true
+  wait "${children[@]}" 2>/dev/null || true
+}
+
+trap 'shutdown; exit 0' TERM INT
+
+uvicorn collector_agent.main:create_app --factory --host 127.0.0.1 --port 8443 &
+children+=("$!")
+
+uvicorn collector_agent.dashboard_react:app --host 0.0.0.0 --port 8502 &
+children+=("$!")
+
+wait -n "${children[@]}"
+status=$?
+shutdown
+exit "$status"

@@ -19,10 +19,12 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY collector_agent/ ./collector_agent/
 RUN python -m pip install --no-cache-dir .
+COPY deploy/entrypoints/flowwave-collector /usr/local/bin/flowwave-collector
 COPY --from=dashboard-build /build/dist ./collector_agent/dashboard_react/dist/
-RUN mkdir --parents /var/lib/flowwave \
+RUN chmod 0555 /usr/local/bin/flowwave-collector \
+    && mkdir --parents /var/lib/flowwave \
     && chown -R flowwave:flowwave /app /var/lib/flowwave
 
 USER flowwave
 EXPOSE 8443 8502 4739/udp
-CMD ["uvicorn", "collector_agent.main:create_app", "--factory", "--host", "127.0.0.1", "--port", "8443"]
+CMD ["/usr/local/bin/flowwave-collector"]

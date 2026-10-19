@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Run the private Control API and the browser-facing Control UI as one
+# application unit.  When either child stops, terminate the other so OCI can
+# restart the complete unit according to the Container Instance policy.
+set -uo pipefail
+
+children=()
+
+shutdown() {
+  trap - TERM INT
+  kill -TERM "${children[@]}" 2>/dev/null || true
+  wait "${children[@]}" 2>/dev/null || true
+}
+
+trap 'shutdown; exit 0' TERM INT
+
+uvicorn control_plane.main:create_app --factory --host 0.0.0.0 --port 8100 \
+  --proxy-headers --forwarded-allow-ips=127.0.0.1 &
+children+=("$!")
+
+uvicorn control_plane.dashboard_react:app --host 0.0.0.0 --port 8503 &
+children+=("$!")
+
+wait -n "${children[@]}"
+status=$?
+shutdown
+exit "$status"

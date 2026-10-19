@@ -20,9 +20,11 @@ COPY pyproject.toml ./
 COPY control_plane/ ./control_plane/
 RUN python -m pip install --no-cache-dir .
 COPY deploy/certs/postgresql-ca.pem /opt/flowwave/certs/postgresql-ca.pem
+COPY deploy/entrypoints/flowwave-control /usr/local/bin/flowwave-control
 COPY --from=dashboard-build /build/dist ./control_plane/dashboard_react/dist/
-RUN chown -R flowwave:flowwave /app /opt/flowwave
+RUN chmod 0555 /usr/local/bin/flowwave-control \
+    && chown -R flowwave:flowwave /app /opt/flowwave
 
 USER flowwave
 EXPOSE 8100 8503
-CMD ["uvicorn", "control_plane.main:create_app", "--factory", "--host", "0.0.0.0", "--port", "8100", "--proxy-headers", "--forwarded-allow-ips=127.0.0.1"]
+CMD ["/usr/local/bin/flowwave-control"]
