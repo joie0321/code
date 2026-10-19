@@ -1,0 +1,60 @@
+{
+  "availabilityDomain": "WGog:AP-SYDNEY-1-AD-1",
+  "compartmentId": "ocid1.compartment.oc1..aaaaaaaaql36aenq3xp66czppan35kzu4gw3o6tkchlghzc37hssiqzzg32a",
+  "containerRestartPolicy": "ALWAYS",
+  "containers": [
+    {
+      "displayName": "control-api",
+      "imageUrl": "syd.ocir.io/idjhqglymefr/flowwave-control:ocid1.devopsbuildrun.oc1.ap-sydney-1.amaaaaaakwetmsaakq3vxsm33rzumo7zjacyuu2a5vr6qcjcxhcf4g6k7r2a",
+      "environmentVariables": {
+        "APP_ENV": "production",
+        "DATABASE_MODE": "oci_vault",
+        "DATABASE_URL": "postgresql+psycopg://ocimigration_app@primary.objllmruws46hisqphga3x6xx3baqa.postgresql.ap-sydney-1.oci.oraclecloud.com:5432/migrationdiscovery_react?sslmode=verify-full&sslrootcert=/opt/flowwave/certs/postgresql-ca.pem",
+        "DATABASE_PASSWORD_SECRET_OCID": "ocid1.vaultsecret.oc1.ap-sydney-1.amaaaaaakwetmsaazttjekyk6rd6yctx7xxszkkdafhfeeokymzzztwkmsbq",
+        "CONTROL_PLANE_ADMIN_API_KEY_SECRET_OCID": "ocid1.vaultsecret.oc1.ap-sydney-1.amaaaaaakwetmsaarlcrmbnubbus7tqqjneietpft763f6sh4rkhq3ksaztq",
+        "CONTROL_PLANE_DASHBOARD_API_KEY_SECRET_OCID": "ocid1.vaultsecret.oc1.ap-sydney-1.amaaaaaakwetmsaahzz7byw7kum6z5d7e34anxe4qg6qinjnjqioy67aiuxq",
+        "CONTROL_PLANE_DASHBOARD_API_URL": "http://127.0.0.1:8100",
+        "CONTROL_PLANE_DASHBOARD_API_LOCAL_LOOPBACK": "true"
+      }
+    },
+    {
+      "displayName": "control-ui",
+      "imageUrl": "syd.ocir.io/idjhqglymefr/flowwave-control:ocid1.devopsbuildrun.oc1.ap-sydney-1.amaaaaaakwetmsaakq3vxsm33rzumo7zjacyuu2a5vr6qcjcxhcf4g6k7r2a",
+      "command": [
+        "uvicorn",
+        "control_plane.dashboard_react:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8503"
+      ],
+      "environmentVariables": {
+        "APP_ENV": "production",
+        "DATABASE_MODE": "oci_vault",
+        "DATABASE_URL": "postgresql+psycopg://ocimigration_app@primary.objllmruws46hisqphga3x6xx3baqa.postgresql.ap-sydney-1.oci.oraclecloud.com:5432/migrationdiscovery_react?sslmode=verify-full&sslrootcert=/opt/flowwave/certs/postgresql-ca.pem",
+        "DATABASE_PASSWORD_SECRET_OCID": "ocid1.vaultsecret.oc1.ap-sydney-1.amaaaaaakwetmsaazttjekyk6rd6yctx7xxszkkdafhfeeokymzzztwkmsbq",
+        "CONTROL_PLANE_ADMIN_API_KEY_SECRET_OCID": "ocid1.vaultsecret.oc1.ap-sydney-1.amaaaaaakwetmsaarlcrmbnubbus7tqqjneietpft763f6sh4rkhq3ksaztq",
+        "CONTROL_PLANE_DASHBOARD_API_KEY_SECRET_OCID": "ocid1.vaultsecret.oc1.ap-sydney-1.amaaaaaakwetmsaahzz7byw7kum6z5d7e34anxe4qg6qinjnjqioy67aiuxq",
+        "CONTROL_PLANE_DASHBOARD_API_URL": "http://127.0.0.1:8100",
+        "CONTROL_PLANE_DASHBOARD_API_LOCAL_LOOPBACK": "true"
+      }
+    }
+  ],
+  "displayName": "flowwave-control-dev",
+  "shape": "CI.Standard.E4.Flex",
+  "shapeConfig": {
+    "ocpus": 2,
+    "memoryInGBs": 8
+  },
+  "vnics": [
+    {
+      "displayName": "flowwave-control-vnic",
+      "hostnameLabel": "flowwavectl",
+      "isPublicIpAssigned": false,
+      "nsgIds": [
+        "ocid1.networksecuritygroup.oc1.ap-sydney-1.aaaaaaaaxitubaqs5zkd7oqbjgzupnbtx43wtbmx4gwo4ix4xl3gkxm2qkzq"
+      ],
+      "subnetId": "ocid1.subnet.oc1.ap-sydney-1.aaaaaaaayo7o56w65gzcsarco6w4wu626pas7n5htmq3nbwwdzoaiidz2nia"
+    }
+  ]
+}

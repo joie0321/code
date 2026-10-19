@@ -1,11 +1,11 @@
 [
   {
-    "description": "Private FlowWave Control API from OCVS_SYD",
+    "description": "FlowWave Control API from the Collector only",
     "direction": "INGRESS",
     "isStateless": false,
     "protocol": "6",
-    "source": "10.7.0.0/16",
-    "sourceType": "CIDR_BLOCK",
+    "source": "ocid1.networksecuritygroup.oc1.ap-sydney-1.aaaaaaaalxeobuakk52jvqzio5zxleo4zaa34r5ctarv3sa5vdmqveooiwsa",
+    "sourceType": "NETWORK_SECURITY_GROUP",
     "tcpOptions": {
       "destinationPortRange": {
         "min": 8100,

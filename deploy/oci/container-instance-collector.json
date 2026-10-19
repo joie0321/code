@@ -1,0 +1,48 @@
+{
+  "availabilityDomain": "WGog:AP-SYDNEY-1-AD-1",
+  "compartmentId": "ocid1.compartment.oc1..aaaaaaaaql36aenq3xp66czppan35kzu4gw3o6tkchlghzc37hssiqzzg32a",
+  "containerRestartPolicy": "ALWAYS",
+  "containers": [
+    {
+      "displayName": "collector-agent",
+      "imageUrl": "syd.ocir.io/idjhqglymefr/flowwave-collector:ocid1.devopsbuildrun.oc1.ap-sydney-1.amaaaaaakwetmsaakq3vxsm33rzumo7zjacyuu2a5vr6qcjcxhcf4g6k7r2a",
+      "environmentVariables": {
+        "APP_ENV": "production",
+        "AGENT_SEQUENCE_STATE_FILE": "/var/lib/flowwave/collector_sequence_state.json"
+      }
+    },
+    {
+      "displayName": "collector-ui",
+      "imageUrl": "syd.ocir.io/idjhqglymefr/flowwave-collector:ocid1.devopsbuildrun.oc1.ap-sydney-1.amaaaaaakwetmsaakq3vxsm33rzumo7zjacyuu2a5vr6qcjcxhcf4g6k7r2a",
+      "command": [
+        "uvicorn",
+        "collector_agent.dashboard_react:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8502"
+      ],
+      "environmentVariables": {
+        "APP_ENV": "production",
+        "AGENT_SEQUENCE_STATE_FILE": "/var/lib/flowwave/collector_sequence_state.json"
+      }
+    }
+  ],
+  "displayName": "flowwave-collector-dev",
+  "shape": "CI.Standard.E4.Flex",
+  "shapeConfig": {
+    "ocpus": 2,
+    "memoryInGBs": 8
+  },
+  "vnics": [
+    {
+      "displayName": "flowwave-collector-vnic",
+      "hostnameLabel": "flowwavecol",
+      "isPublicIpAssigned": false,
+      "nsgIds": [
+        "ocid1.networksecuritygroup.oc1.ap-sydney-1.aaaaaaaalxeobuakk52jvqzio5zxleo4zaa34r5ctarv3sa5vdmqveooiwsa"
+      ],
+      "subnetId": "ocid1.subnet.oc1.ap-sydney-1.aaaaaaaayo7o56w65gzcsarco6w4wu626pas7n5htmq3nbwwdzoaiidz2nia"
+    }
+  ]
+}

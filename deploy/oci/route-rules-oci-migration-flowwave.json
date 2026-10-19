@@ -1,0 +1,9 @@
+[
+  {
+    "description": "Private OCI services access for FlowWave image pulls and Vault",
+    "destination": "all-syd-services-in-oracle-services-network",
+    "destinationType": "SERVICE_CIDR_BLOCK",
+    "networkEntityId": "ocid1.servicegateway.oc1.ap-sydney-1.aaaaaaaa7eiqur3k4q25sq6x3kb6c3kjoxtcxbocbhxnfjypfxckpxuprnda",
+    "routeType": "STATIC"
+  }
+]
