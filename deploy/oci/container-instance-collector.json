@@ -5,7 +5,7 @@
   "containers": [
     {
       "displayName": "collector",
-      "imageUrl": "syd.ocir.io/idjhqglymefr/flowwave-collector:ocid1.devopsbuildrun.oc1.ap-sydney-1.amaaaaaakwetmsaakq3vxsm33rzumo7zjacyuu2a5vr6qcjcxhcf4g6k7r2a",
+      "imageUrl": "syd.ocir.io/idjhqglymefr/flowwave-collector:ocid1.devopsbuildrun.oc1.ap-sydney-1.amaaaaaakwetmsaachptugju7okklcpdp4awla3uzawaxkrmx4idaivv67cq",
       "environmentVariables": {
         "APP_ENV": "production",
         "AGENT_SEQUENCE_STATE_FILE": "/var/lib/flowwave/collector_sequence_state.json"
