@@ -25,4 +25,4 @@ RUN mkdir --parents /var/lib/flowwave \
 
 USER flowwave
 EXPOSE 8443 8502 4739/udp
-CMD ["uvicorn", "collector_agent.main:app", "--host", "127.0.0.1", "--port", "8443"]
+CMD ["uvicorn", "collector_agent.main:create_app", "--factory", "--host", "127.0.0.1", "--port", "8443"]
