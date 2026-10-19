@@ -7,7 +7,7 @@
       "displayName": "collector",
       "imageUrl": "syd.ocir.io/idjhqglymefr/flowwave-collector:ocid1.devopsbuildrun.oc1.ap-sydney-1.amaaaaaakwetmsaachptugju7okklcpdp4awla3uzawaxkrmx4idaivv67cq",
       "environmentVariables": {
-        "APP_ENV": "production",
+        "APP_ENV": "development",
         "AGENT_SEQUENCE_STATE_FILE": "/var/lib/flowwave/collector_sequence_state.json"
       }
     }
