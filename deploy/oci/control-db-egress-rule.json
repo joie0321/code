@@ -1,0 +1,15 @@
+[
+  {
+    "direction": "EGRESS",
+    "protocol": "6",
+    "destination": "10.7.26.54/32",
+    "destinationType": "CIDR_BLOCK",
+    "tcpOptions": {
+      "destinationPortRange": {
+        "min": 5432,
+        "max": 5432
+      }
+    },
+    "description": "FlowWave Control PostgreSQL access"
+  }
+]
