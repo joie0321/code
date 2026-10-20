@@ -3,8 +3,9 @@ import { useCallback, useEffect, useState } from "react";
 import { api } from "./api";
 import { CollectorStatusParity, EnrollCollectorParity, InventoryFilteredParity } from "./ControlPlanePages";
 import { CurrentEnvironment } from "./CurrentEnvironment";
+import { Reporting } from "./Reporting";
 
-type Page = "environment" | "status" | "enroll" | "inventory";
+type Page = "environment" | "status" | "enroll" | "inventory" | "reports";
 
 function App() {
   const [page, setPage] = useState<Page>("environment");
@@ -34,10 +35,12 @@ function App() {
     status: "Agent Collector's Status",
     enroll: "Enroll Agent Collector",
     inventory: "VM/Server Inventory",
+    reports: "Migration Reports",
   };
   const navigationGroups: Array<{ label: string; pages: Page[] }> = [
     { label: "Agent Collectors", pages: ["enroll", "status"] },
     { label: "Discovery", pages: ["environment", "inventory"] },
+    { label: "Reports", pages: ["reports"] },
   ];
 
   return <div className="app-shell">
@@ -51,6 +54,7 @@ function App() {
     {!error && page === "status" ? <CollectorStatusParity collectors={collectors} onChanged={reloadCollectors} /> : null}
     {!error && page === "enroll" ? <EnrollCollectorParity collectors={collectors} /> : null}
     {!error && page === "inventory" ? <InventoryFilteredParity collectors={collectors} /> : null}
+    {!error && page === "reports" ? <Reporting collectors={collectors} /> : null}
   </div>;
 }
 

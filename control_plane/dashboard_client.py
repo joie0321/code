@@ -331,6 +331,26 @@ class ControlPlaneDashboardClient:
             )
         return response
 
+    def wave_grouping_port_allowlist(self, collector_id: str) -> dict[str, Any]:
+        response = self._get(
+            f"/api/v1/dashboard/collectors/{collector_id}/wave-grouping-port-allowlist"
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("ports"), list):
+            raise DashboardClientError("Control plane returned an invalid wave-grouping policy")
+        return response
+
+    def update_wave_grouping_port_allowlist(
+        self, collector_id: str, ports: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        response = self._put(
+            f"/api/v1/dashboard/collectors/{collector_id}/wave-grouping-port-allowlist",
+            {"ports": ports},
+            self._dashboard_key,
+        )
+        if not isinstance(response, dict) or not isinstance(response.get("ports"), list):
+            raise DashboardClientError("Control plane returned an invalid wave-grouping policy")
+        return response
+
     def wave_readiness(
         self,
         collector_id: str,
@@ -409,7 +429,7 @@ class ControlPlaneDashboardClient:
         )
         return self._read_response(request)
 
-    def _put(self, path: str, payload: dict[str, str], key: str) -> Any:
+    def _put(self, path: str, payload: dict[str, Any], key: str) -> Any:
         request = Request(
             f"{self._base_url}{path}",
             data=json.dumps(payload).encode("utf-8"),

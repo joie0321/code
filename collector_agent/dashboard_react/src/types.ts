@@ -6,12 +6,16 @@ export interface CollectorSource {
   azure_configured?: boolean;
   aws_configured?: boolean;
   aws_flow_logs_configured?: boolean;
+  aws_flow_log_collection_enabled?: boolean;
+  aws_flow_log_sync_in_progress?: boolean;
   aws_flow_log_status?: string;
   aws_flow_log_detail?: string;
   aws_flow_log_objects_processed?: number;
   aws_flow_log_observations_uploaded?: number;
   aws_flow_log_last_sync_at?: string | null;
   azure_flow_logs_configured?: boolean;
+  azure_flow_log_collection_enabled?: boolean;
+  azure_flow_log_sync_in_progress?: boolean;
   azure_flow_log_status?: string;
   azure_flow_log_detail?: string;
   azure_flow_log_objects_processed?: number;

@@ -105,6 +105,10 @@ export function configureAwsFlowLogs(payload: object): Promise<{ status: string 
 export function syncInventory(collectorId: string): Promise<InventorySyncResult> { return collectorAction("/api/v1/collection/inventory/sync", collectorId); }
 export function syncAwsFlowLogs(collectorId: string): Promise<FlowSyncResult> { return collectorAction("/api/v1/aws/flow-logs/sync", collectorId); }
 export function syncAzureFlowLogs(collectorId: string): Promise<FlowSyncResult> { return collectorAction("/api/v1/azure/flow-logs/sync", collectorId); }
+export function stopAwsFlowLogs(collectorId: string): Promise<{ status: string }> { return collectorAction("/api/v1/aws/flow-logs/stop", collectorId); }
+export function startAwsFlowLogs(collectorId: string): Promise<{ status: string }> { return collectorAction("/api/v1/aws/flow-logs/start", collectorId); }
+export function stopAzureFlowLogs(collectorId: string): Promise<{ status: string }> { return collectorAction("/api/v1/azure/flow-logs/stop", collectorId); }
+export function startAzureFlowLogs(collectorId: string): Promise<{ status: string }> { return collectorAction("/api/v1/azure/flow-logs/start", collectorId); }
 export function stopIpfix(collectorId: string): Promise<{ status: string }> { return collectorAction("/api/v1/ipfix/stop", collectorId); }
 export function startIpfix(payload: object): Promise<{ status: string }> { return requestJson("/api/v1/ipfix/start", "POST", payload); }
 

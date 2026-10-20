@@ -31,6 +31,7 @@ from control_plane.models import (
     ReconnectionCode,
 )
 from control_plane.reporting import (
+    capture_recommended_wave_snapshot,
     connection_report,
     current_environment_report,
     dependency_review_report,
@@ -55,6 +56,7 @@ from control_plane.schemas import (
     ReconnectionCodeCreate,
     ReconnectionCodeCreated,
     UploadResult,
+    WaveGroupingPortAllowlistUpdate,
 )
 
 _COLLECTOR_OFFLINE_AFTER_SECONDS = 180
@@ -526,6 +528,9 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
         if existing is not None:
             return UploadResult(accepted=0, duplicate=True)
         now = _now()
+        # Preserve the outgoing automatic recommendation before the new
+        # inventory state changes membership eligibility.
+        capture_recommended_wave_snapshot(session, collector.id, now)
         active_vms = session.scalars(
             select(InventoryVm).where(
                 InventoryVm.collector_id == collector.id,
@@ -805,9 +810,11 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             for vm in vms
         ]
 
-    def _require_collector(collector_id: str, session: Session) -> None:
-        if session.get(Collector, collector_id) is None:
+    def _require_collector(collector_id: str, session: Session) -> Collector:
+        collector = session.get(Collector, collector_id)
+        if collector is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="not found")
+        return collector
 
     @app.get(
         "/api/v1/dashboard/collectors/{collector_id}/connections",
@@ -1574,5 +1581,36 @@ def create_app(settings: ControlPlaneSettings | None = None) -> FastAPI:
             traffic_batch_id=traffic_batch_id,
             received_after=traffic_received_after,
         )
+
+    @app.get(
+        "/api/v1/dashboard/collectors/{collector_id}/wave-grouping-port-allowlist",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def get_wave_grouping_port_allowlist(
+        collector_id: str, session: Session = Depends(get_session)
+    ) -> dict[str, list[dict[str, object]]]:
+        collector = _require_collector(collector_id, session)
+        ports = collector.wave_grouping_port_allowlist
+        return {"ports": ports if isinstance(ports, list) else []}
+
+    @app.put(
+        "/api/v1/dashboard/collectors/{collector_id}/wave-grouping-port-allowlist",
+        dependencies=[Depends(require_dashboard)],
+    )
+    def update_wave_grouping_port_allowlist(
+        collector_id: str,
+        payload: WaveGroupingPortAllowlistUpdate,
+        session: Session = Depends(get_session),
+    ) -> dict[str, list[dict[str, object]]]:
+        """Persist explicit dynamic application ports for automatic wave grouping."""
+
+        collector = _require_collector(collector_id, session)
+        ports = [
+            {"protocol": item.protocol, "port": item.port}
+            for item in sorted(payload.ports, key=lambda item: (item.protocol, item.port))
+        ]
+        collector.wave_grouping_port_allowlist = ports
+        session.commit()
+        return {"ports": ports}
 
     return app

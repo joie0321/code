@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from uuid import uuid4
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
@@ -12,6 +13,7 @@ from sqlalchemy.orm import Session
 from control_plane.models import (
     Collector,
     DependencyDecision,
+    InventoryBatch,
     InventoryVm,
     InventoryVmState,
     MigrationPlan,
@@ -19,6 +21,7 @@ from control_plane.models import (
     MigrationPlanVm,
     Observation,
     ObservationBatch,
+    RecommendedWaveSnapshot,
 )
 
 _BACKGROUND_UDP_SERVICES = {
@@ -72,6 +75,8 @@ def _traffic_class(protocol: str, destination_port: int) -> str:
         if _is_dynamic_private_port(destination_port):
             return "Background infrastructure (Dynamic/private UDP)"
         return "Application UDP"
+    if _is_dynamic_private_port(destination_port):
+        return "Dynamic/private TCP (review only)"
     return "Application TCP"
 
 
@@ -81,19 +86,45 @@ def _is_dynamic_private_port(destination_port: int) -> bool:
     return _DYNAMIC_PRIVATE_PORT_START <= destination_port <= _DYNAMIC_PRIVATE_PORT_END
 
 
-def _is_wave_grouping_observation(protocol: str, destination_port: int) -> bool:
+def _wave_grouping_port_allowlist(
+    session: Session, collector_id: str
+) -> frozenset[tuple[str, int]]:
+    """Return validated, server-stored dynamic ports approved for one source."""
+
+    collector = session.get(Collector, collector_id)
+    entries = collector.wave_grouping_port_allowlist if collector else []
+    if not isinstance(entries, list):
+        return frozenset()
+    return frozenset(
+        (str(entry.get("protocol")).casefold(), int(entry["port"]))
+        for entry in entries
+        if isinstance(entry, dict)
+        and str(entry.get("protocol")).casefold() in {"tcp", "udp"}
+        and isinstance(entry.get("port"), int)
+        and _is_dynamic_private_port(entry["port"])
+    )
+
+
+def _is_wave_grouping_observation(
+    protocol: str,
+    destination_port: int,
+    approved_dynamic_ports: frozenset[tuple[str, int]] = frozenset(),
+) -> bool:
     """Return whether an internal observation can form an automatic wave edge.
 
-    TCP is application evidence by default. UDP is also application evidence
-    unless it targets a known shared-infrastructure service or the configured
-    dynamic/private noise-filter range. This keeps DNS, DHCP, NTP, DHCPv6, and
-    ephemeral UDP traffic from grouping otherwise independent workloads.
+    TCP and UDP are application evidence by default, except known
+    shared-infrastructure ports and dynamic/private ports. A dynamic/private
+    port can form a wave only after the operator explicitly approves its exact
+    protocol/port pair for this collector.
     """
 
-    return protocol == "tcp" or (
-        protocol == "udp"
-        and destination_port not in _BACKGROUND_UDP_SERVICES
-        and not _is_dynamic_private_port(destination_port)
+    normalized_protocol = protocol.casefold()
+    if normalized_protocol not in {"tcp", "udp"}:
+        return False
+    if _is_dynamic_private_port(destination_port):
+        return (normalized_protocol, destination_port) in approved_dynamic_ports
+    return normalized_protocol == "tcp" or (
+        normalized_protocol == "udp" and destination_port not in _BACKGROUND_UDP_SERVICES
     )
 
 
@@ -566,7 +597,9 @@ def dependency_review_report(
             observation.destination_port
         ):
             category, classification = "Shared infrastructure", "Dynamic/private UDP"
-            reason = "Dynamic/private UDP traffic is reporting-only and never merges migration waves."
+            reason = (
+                "Dynamic/private UDP traffic is reporting-only and never merges migration waves."
+            )
         elif (
             observation.protocol == "tcp"
             and observation.destination_port in _CANDIDATE_SHARED_TCP_SERVICES
@@ -753,6 +786,7 @@ def migration_waves(
     inventory_by_uuid = {vm.vm_uuid: vm for vm in inventory}
     vm_uuid_by_ip = {ip: vm.vm_uuid for vm in eligible for ip in vm.ips.split(",") if ip}
     known_vm_by_ip = _vms_by_ip(inventory)
+    approved_dynamic_ports = _wave_grouping_port_allowlist(session, collector_id)
     graph: dict[str, set[str]] = defaultdict(set)
     unavailable_by_eligible_vm: dict[str, dict[str, dict[str, object]]] = defaultdict(dict)
     if observations is None:
@@ -766,7 +800,7 @@ def migration_waves(
         )
     for observation in observations:
         if not _is_wave_grouping_observation(
-            observation.protocol, observation.destination_port
+            observation.protocol, observation.destination_port, approved_dynamic_ports
         ):
             continue
         source_uuid = observation.source_vm_uuid
@@ -840,12 +874,213 @@ def migration_waves(
                 "Observed internal application TCP/UDP dependencies connect these servers; "
                 "review external and shared service dependencies before cutover."
                 if len(component) > 1
-                else "No internal application TCP/UDP dependency was observed in the selected time range."
+                else (
+                    "No internal application TCP/UDP dependency was observed in the selected "
+                    "time range."
+                )
             ),
             "plan_status": "recommended",
         }
         for index, component in enumerate(components, start=1)
     ]
+
+
+def capture_recommended_wave_snapshot(
+    session: Session,
+    collector_id: str,
+    captured_at: datetime,
+) -> None:
+    """Persist automatic-wave membership before an inventory update replaces it.
+
+    A snapshot is keyed to the inventory batch it represents. This function is
+    called in the same transaction as the next inventory update, so a current
+    report can accurately explain what changed without retaining traffic or
+    secrets outside the existing Control Plane database.
+    """
+
+    previous_batch = session.scalar(
+        select(InventoryBatch)
+        .where(InventoryBatch.collector_id == collector_id)
+        .order_by(InventoryBatch.received_at.desc())
+        .limit(1)
+    )
+    if previous_batch is None:
+        return
+    existing = session.scalar(
+        select(RecommendedWaveSnapshot).where(
+            RecommendedWaveSnapshot.collector_id == collector_id,
+            RecommendedWaveSnapshot.inventory_batch_id == previous_batch.id,
+        )
+    )
+    if existing is not None:
+        return
+    waves = migration_waves(
+        session,
+        collector_id,
+        use_approved_plan=False,
+        received_after=previous_batch.received_at,
+    )
+    serialized_waves = [
+        {
+            "wave": int(wave["wave"]),
+            "members": [
+                {"vm_uuid": vm_uuid, "name": vm_name}
+                for vm_uuid, vm_name in zip(
+                    wave["server_vm_uuids"], wave["server_names"], strict=True
+                )
+            ],
+        }
+        for wave in waves
+    ]
+    session.add(
+        RecommendedWaveSnapshot(
+            id=str(uuid4()),
+            collector_id=collector_id,
+            inventory_batch_id=previous_batch.id,
+            captured_at=captured_at,
+            waves=serialized_waves,
+        )
+    )
+
+
+def _current_unavailability(
+    vm: InventoryVm | None,
+    previous_name: str,
+) -> dict[str, object] | None:
+    """Describe why a prior wave member cannot be acted on now."""
+
+    if vm is None:
+        return {
+            "name": previous_name,
+            "state": "removed",
+            "reason": "no longer present in inventory",
+        }
+    if not vm.is_active:
+        state = "missing" if vm.lifecycle_status == "missing" else "removed"
+        return {
+            "name": vm.name,
+            "state": state,
+            "reason": "no longer present in the latest inventory snapshot",
+        }
+    if (vm.power_state or "").casefold() != "poweredon":
+        return {
+            "name": vm.name,
+            "state": "powered off",
+            "reason": f"power state is {vm.power_state or 'unknown'}",
+        }
+    return None
+
+
+def _availability_warning(
+    previous_wave: int | None,
+    members: list[dict[str, object]],
+    plan_review: bool = False,
+) -> dict[str, object]:
+    warning: dict[str, object] = {"members": members}
+    if previous_wave is not None:
+        warning["previous_wave"] = previous_wave
+    if plan_review:
+        warning["plan_review"] = True
+    return warning
+
+
+def _apply_recommendation_history(
+    session: Session,
+    collector_id: str,
+    waves: list[dict[str, object]],
+    historical: bool,
+) -> list[dict[str, object]]:
+    """Annotate current waves and return former waves now wholly unavailable."""
+
+    if historical:
+        return []
+    inventory_by_uuid = {vm.vm_uuid: vm for vm in _inventory(session, collector_id)}
+    if waves and all(wave.get("plan_status") == "approved" for wave in waves):
+        for wave in waves:
+            unavailable = [
+                detail
+                for vm_uuid, name in zip(
+                    wave["server_vm_uuids"], wave["server_names"], strict=True
+                )
+                if (
+                    detail := _current_unavailability(
+                        inventory_by_uuid.get(str(vm_uuid)), str(name)
+                    )
+                )
+                is not None
+            ]
+            if unavailable:
+                wave["availability_warnings"] = [_availability_warning(None, unavailable, True)]
+        return []
+
+    snapshots = session.scalars(
+        select(RecommendedWaveSnapshot)
+        .where(RecommendedWaveSnapshot.collector_id == collector_id)
+        .order_by(RecommendedWaveSnapshot.captured_at.desc())
+    ).all()
+    if not snapshots:
+        return []
+
+    retired_waves: list[dict[str, object]] = []
+    processed_members: set[str] = set()
+    for snapshot in snapshots:
+        if not isinstance(snapshot.waves, list):
+            continue
+        for recorded_wave in snapshot.waves:
+            if not isinstance(recorded_wave, dict):
+                continue
+            raw_members = recorded_wave.get("members")
+            if not isinstance(raw_members, list):
+                continue
+            previous_wave = recorded_wave.get("wave")
+            if not isinstance(previous_wave, int):
+                continue
+            members = [member for member in raw_members if isinstance(member, dict)]
+            newest_members = [
+                member
+                for member in members
+                if isinstance(member.get("vm_uuid"), str)
+                and member["vm_uuid"] not in processed_members
+            ]
+            processed_members.update(str(member["vm_uuid"]) for member in newest_members)
+            unavailable = [
+                detail
+                for member in newest_members
+                if (
+                    detail := _current_unavailability(
+                        inventory_by_uuid.get(member["vm_uuid"]),
+                        str(member.get("name") or member["vm_uuid"]),
+                    )
+                )
+                is not None
+            ]
+            if not unavailable:
+                continue
+            previous_member_ids = {
+                str(member["vm_uuid"])
+                for member in members
+                if isinstance(member.get("vm_uuid"), str)
+            }
+            matching_waves = [
+                wave
+                for wave in waves
+                if previous_member_ids.intersection(map(str, wave["server_vm_uuids"]))
+            ]
+            warning = _availability_warning(previous_wave, unavailable)
+            if matching_waves:
+                for wave in matching_waves:
+                    wave.setdefault("availability_warnings", []).append(warning)
+                continue
+            retired_waves.append(
+                {
+                    "previous_wave": previous_wave,
+                    "members": unavailable,
+                    "reason": (
+                        "All remaining members of this previous recommendation are unavailable."
+                    ),
+                }
+            )
+    return retired_waves
 
 
 def wave_summary(
@@ -868,6 +1103,7 @@ def wave_summary(
     eligible = _eligible_vms(inventory)
     eligible_uuids = {vm.vm_uuid for vm in eligible}
     eligible_by_ip = {ip: vm.vm_uuid for vm in eligible for ip in vm.ips.split(",") if ip}
+    approved_dynamic_ports = _wave_grouping_port_allowlist(session, collector_id)
     connected: set[str] = set()
     if observations is None:
         observations = _observations(
@@ -880,7 +1116,7 @@ def wave_summary(
         )
     for observation in observations:
         if not _is_wave_grouping_observation(
-            observation.protocol, observation.destination_port
+            observation.protocol, observation.destination_port, approved_dynamic_ports
         ):
             continue
         if observation.source_vm_uuid in eligible_uuids:
@@ -950,7 +1186,8 @@ def current_environment_report(
         received_after=received_after,
         observations=observations,
     )
-    return {
+    retired_waves = _apply_recommendation_history(session, collector_id, waves, historical)
+    result: dict[str, object] = {
         "connections": connection_report(
             session,
             collector_id,
@@ -974,6 +1211,9 @@ def current_environment_report(
             waves=waves,
         ),
     }
+    if retired_waves:
+        result["retired_waves"] = retired_waves
+    return result
 
 
 def plan_drift_report(session: Session, collector_id: str) -> dict[str, object]:
@@ -1177,7 +1417,10 @@ def wave_readiness_report(
             review_counts[readiness_status] += 1
             review_items.append(
                 {
-                    "dependency": f"{item['source_vm']} → {item['destination']} ({item['destination_ip']}) {item['port_service']}",
+                    "dependency": (
+                        f"{item['source_vm']} → {item['destination']} "
+                        f"({item['destination_ip']}) {item['port_service']}"
+                    ),
                     "planner_decision": decision,
                     "readiness_status": readiness_status,
                     "planner_note": saved_decision.note if saved_decision else None,

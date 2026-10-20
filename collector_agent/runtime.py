@@ -69,6 +69,8 @@ class _SourceProfile:
     vcenter_credentials: VCenterCredentials | None = None
     azure_credentials: AzureCredentials | None = None
     azure_flow_log_settings: AzureFlowLogSettings | None = None
+    azure_flow_log_collection_enabled: bool = True
+    azure_flow_log_sync_in_progress: bool = False
     azure_flow_log_object_versions: set[str] = field(default_factory=set)
     azure_flow_log_last_sync_at: datetime | None = None
     azure_flow_log_objects_processed: int = 0
@@ -76,6 +78,8 @@ class _SourceProfile:
     azure_flow_log_last_error: str | None = None
     aws_credentials: AwsCredentials | None = None
     aws_flow_log_settings: AwsFlowLogSettings | None = None
+    aws_flow_log_collection_enabled: bool = True
+    aws_flow_log_sync_in_progress: bool = False
     aws_flow_log_object_keys: set[str] = field(default_factory=set)
     aws_flow_log_last_sync_at: datetime | None = None
     aws_flow_log_objects_processed: int = 0
@@ -283,9 +287,52 @@ class AgentRuntime:
                 prefix=request.prefix,
             )
             profile.azure_flow_log_object_versions.clear()
+            profile.azure_flow_log_collection_enabled = True
             profile.azure_flow_log_last_error = None
 
+    def stop_azure_flow_logs(self, collector_id: str) -> dict[str, str]:
+        """Pause Azure Flow Log reads while retaining the configured location."""
+
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            if profile.source_type != "azure" or profile.azure_flow_log_settings is None:
+                raise ValueError(
+                    "Configure the Azure Blob Flow Log location before stopping collection"
+                )
+            profile.azure_flow_log_collection_enabled = False
+            return {"status": "stopped"}
+
+    def start_azure_flow_logs(self, collector_id: str) -> dict[str, str]:
+        """Resume Azure Flow Log reads for an already configured source."""
+
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            if profile.source_type != "azure" or profile.azure_flow_log_settings is None:
+                raise ValueError(
+                    "Configure the Azure Blob Flow Log location before resuming collection"
+                )
+            if profile.azure_flow_log_sync_in_progress:
+                raise ValueError("Wait for the active Azure Flow Log synchronization to finish")
+            profile.azure_flow_log_collection_enabled = True
+            profile.azure_flow_log_last_sync_at = None
+            profile.azure_flow_log_last_error = None
+            return {"status": "started"}
+
     def sync_azure_flow_logs(self, collector_id: str) -> dict[str, int]:
+        """Perform at most one Azure Flow Log synchronization per source."""
+
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            if profile.azure_flow_log_sync_in_progress:
+                raise ValueError("Azure Flow Log synchronization is already running")
+            profile.azure_flow_log_sync_in_progress = True
+        try:
+            return self._sync_azure_flow_logs(collector_id)
+        finally:
+            with self._lock:
+                self._source_or_raise(collector_id).azure_flow_log_sync_in_progress = False
+
+    def _sync_azure_flow_logs(self, collector_id: str) -> dict[str, int]:
         """Read unseen Azure VNet Flow Log blobs and upload inventory-matched observations."""
 
         with self._lock:
@@ -298,6 +345,10 @@ class AgentRuntime:
                 )
             if profile.azure_flow_log_settings is None:
                 raise ValueError("Configure the Azure Blob Flow Log location before synchronizing")
+            if not profile.azure_flow_log_collection_enabled:
+                raise ValueError(
+                    "Azure Flow Log collection is stopped. Resume collection before synchronizing"
+                )
             credentials = profile.azure_credentials
             settings = profile.azure_flow_log_settings
             known_versions = set(profile.azure_flow_log_object_versions)
@@ -383,9 +434,52 @@ class AgentRuntime:
                 prefix=request.s3_prefix,
             )
             profile.aws_flow_log_object_keys.clear()
+            profile.aws_flow_log_collection_enabled = True
             profile.aws_flow_log_last_error = None
 
+    def stop_aws_flow_logs(self, collector_id: str) -> dict[str, str]:
+        """Pause VPC Flow Log reads while retaining the configured S3 location."""
+
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            if profile.source_type != "aws" or profile.aws_flow_log_settings is None:
+                raise ValueError(
+                    "Configure the S3 VPC Flow Log location before stopping collection"
+                )
+            profile.aws_flow_log_collection_enabled = False
+            return {"status": "stopped"}
+
+    def start_aws_flow_logs(self, collector_id: str) -> dict[str, str]:
+        """Resume VPC Flow Log reads for an already configured source."""
+
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            if profile.source_type != "aws" or profile.aws_flow_log_settings is None:
+                raise ValueError(
+                    "Configure the S3 VPC Flow Log location before resuming collection"
+                )
+            if profile.aws_flow_log_sync_in_progress:
+                raise ValueError("Wait for the active VPC Flow Log synchronization to finish")
+            profile.aws_flow_log_collection_enabled = True
+            profile.aws_flow_log_last_sync_at = None
+            profile.aws_flow_log_last_error = None
+            return {"status": "started"}
+
     def sync_aws_flow_logs(self, collector_id: str) -> dict[str, int]:
+        """Perform at most one AWS Flow Log synchronization per source."""
+
+        with self._lock:
+            profile = self._source_or_raise(collector_id)
+            if profile.aws_flow_log_sync_in_progress:
+                raise ValueError("VPC Flow Log synchronization is already running")
+            profile.aws_flow_log_sync_in_progress = True
+        try:
+            return self._sync_aws_flow_logs(collector_id)
+        finally:
+            with self._lock:
+                self._source_or_raise(collector_id).aws_flow_log_sync_in_progress = False
+
+    def _sync_aws_flow_logs(self, collector_id: str) -> dict[str, int]:
         """Read unseen VPC Flow Log objects and upload inventory-matched observations."""
 
         with self._lock:
@@ -396,6 +490,10 @@ class AgentRuntime:
                 raise ValueError("Configure AWS credentials before synchronizing VPC Flow Logs")
             if profile.aws_flow_log_settings is None:
                 raise ValueError("Configure the S3 VPC Flow Log location before synchronizing")
+            if not profile.aws_flow_log_collection_enabled:
+                raise ValueError(
+                    "VPC Flow Log collection is stopped. Resume collection before synchronizing"
+                )
             credentials = profile.aws_credentials
             settings = profile.aws_flow_log_settings
             known_object_keys = set(profile.aws_flow_log_object_keys)
@@ -874,6 +972,8 @@ class AgentRuntime:
             "vcenter_configured": profile.vcenter_credentials is not None,
             "azure_configured": profile.azure_credentials is not None,
             "azure_flow_logs_configured": profile.azure_flow_log_settings is not None,
+            "azure_flow_log_collection_enabled": profile.azure_flow_log_collection_enabled,
+            "azure_flow_log_sync_in_progress": profile.azure_flow_log_sync_in_progress,
             "azure_flow_log_status": azure_flow_log_status,
             "azure_flow_log_detail": azure_flow_log_detail,
             "azure_flow_log_last_sync_at": self._timestamp(profile.azure_flow_log_last_sync_at),
@@ -881,6 +981,8 @@ class AgentRuntime:
             "azure_flow_log_observations_uploaded": profile.azure_flow_log_observations_uploaded,
             "aws_configured": profile.aws_credentials is not None,
             "aws_flow_logs_configured": profile.aws_flow_log_settings is not None,
+            "aws_flow_log_collection_enabled": profile.aws_flow_log_collection_enabled,
+            "aws_flow_log_sync_in_progress": profile.aws_flow_log_sync_in_progress,
             "aws_flow_log_status": aws_flow_log_status,
             "aws_flow_log_detail": aws_flow_log_detail,
             "aws_flow_log_last_sync_at": self._timestamp(profile.aws_flow_log_last_sync_at),
@@ -928,6 +1030,8 @@ class AgentRuntime:
             return "Not applicable", "VPC Flow Logs are used only by AWS sources."
         if profile.aws_flow_log_settings is None:
             return "Not configured", "No S3 VPC Flow Log location is configured."
+        if not profile.aws_flow_log_collection_enabled:
+            return "Stopped", "VPC Flow Log collection is paused until it is resumed."
         if profile.aws_flow_log_last_error:
             return "Error", profile.aws_flow_log_last_error
         if profile.aws_flow_log_last_sync_at is None:
@@ -945,6 +1049,8 @@ class AgentRuntime:
                 "Not configured",
                 "No Azure Blob Virtual Network Flow Log location is configured.",
             )
+        if not profile.azure_flow_log_collection_enabled:
+            return "Stopped", "Virtual Network Flow Log collection is paused until it is resumed."
         if profile.azure_flow_log_last_error:
             return "Error", profile.azure_flow_log_last_error
         if profile.azure_flow_log_last_sync_at is None:
@@ -1029,6 +1135,7 @@ class AgentRuntime:
                     should_sync_aws_flow_logs = (
                         profile.source_type == "aws"
                         and profile.aws_flow_log_settings is not None
+                        and profile.aws_flow_log_collection_enabled
                         and (
                             profile.aws_flow_log_last_sync_at is None
                             or datetime.now(UTC) - profile.aws_flow_log_last_sync_at
@@ -1043,6 +1150,7 @@ class AgentRuntime:
                     should_sync_azure_flow_logs = (
                         profile.source_type == "azure"
                         and profile.azure_flow_log_settings is not None
+                        and profile.azure_flow_log_collection_enabled
                         and (
                             profile.azure_flow_log_last_sync_at is None
                             or datetime.now(UTC) - profile.azure_flow_log_last_sync_at

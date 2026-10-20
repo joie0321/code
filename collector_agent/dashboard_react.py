@@ -21,6 +21,11 @@ from fastapi.staticfiles import StaticFiles
 
 _COLLECTOR_API_ORIGIN = "http://127.0.0.1:8443"
 _STATUS_PATH = "/api/v1/status"
+_DEFAULT_COLLECTOR_TIMEOUT_SECONDS = 10
+_FLOW_LOG_SYNC_TIMEOUT_SECONDS = 300
+_FLOW_LOG_SYNC_PATHS = frozenset(
+    {"/api/v1/aws/flow-logs/sync", "/api/v1/azure/flow-logs/sync"}
+)
 _JSON_POST_PATHS = frozenset(
     {
         "/api/v1/setup/register",
@@ -62,7 +67,12 @@ def _safe_error_detail(error: HTTPError) -> str:
     return "Collector agent request was rejected"
 
 
-def _collector_request(path: str, method: str, body: bytes | None = None) -> object:
+def _collector_request(
+    path: str,
+    method: str,
+    body: bytes | None = None,
+    timeout_seconds: int = _DEFAULT_COLLECTOR_TIMEOUT_SECONDS,
+) -> object:
     """Call one fixed loopback Collector API endpoint without logging its body."""
 
     request = Request(
@@ -72,7 +82,7 @@ def _collector_request(path: str, method: str, body: bytes | None = None) -> obj
         method=method,
     )
     try:
-        with urlopen(request, timeout=10) as response:  # noqa: S310 - fixed loopback service
+        with urlopen(request, timeout=timeout_seconds) as response:  # noqa: S310 - fixed loopback service
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         raise CollectorRequestRejected(error.code, _safe_error_detail(error)) from error
@@ -189,9 +199,25 @@ def create_react_dashboard_app() -> FastAPI:
     def sync_aws_flow_logs(collector_id: str | None = None) -> JSONResponse:
         return _forward_collector_action("/api/v1/aws/flow-logs/sync", "POST", collector_id)
 
+    @app.post("/api/v1/aws/flow-logs/stop")
+    def stop_aws_flow_logs(collector_id: str | None = None) -> JSONResponse:
+        return _forward_collector_action("/api/v1/aws/flow-logs/stop", "POST", collector_id)
+
+    @app.post("/api/v1/aws/flow-logs/start")
+    def start_aws_flow_logs(collector_id: str | None = None) -> JSONResponse:
+        return _forward_collector_action("/api/v1/aws/flow-logs/start", "POST", collector_id)
+
     @app.post("/api/v1/azure/flow-logs/sync")
     def sync_azure_flow_logs(collector_id: str | None = None) -> JSONResponse:
         return _forward_collector_action("/api/v1/azure/flow-logs/sync", "POST", collector_id)
+
+    @app.post("/api/v1/azure/flow-logs/stop")
+    def stop_azure_flow_logs(collector_id: str | None = None) -> JSONResponse:
+        return _forward_collector_action("/api/v1/azure/flow-logs/stop", "POST", collector_id)
+
+    @app.post("/api/v1/azure/flow-logs/start")
+    def start_azure_flow_logs(collector_id: str | None = None) -> JSONResponse:
+        return _forward_collector_action("/api/v1/azure/flow-logs/start", "POST", collector_id)
 
     @app.delete("/api/v1/setup/sources/{collector_id}")
     def unregister_source(collector_id: str) -> JSONResponse:
@@ -266,7 +292,16 @@ def _forward_collector_action(path: str, method: str, collector_id: str | None) 
 
     validated_id = _collector_id_or_raise(collector_id)
     try:
-        payload = _collector_request(f"{path}?collector_id={quote(validated_id, safe='')}", method)
+        timeout_seconds = (
+            _FLOW_LOG_SYNC_TIMEOUT_SECONDS
+            if path in _FLOW_LOG_SYNC_PATHS
+            else _DEFAULT_COLLECTOR_TIMEOUT_SECONDS
+        )
+        payload = _collector_request(
+            f"{path}?collector_id={quote(validated_id, safe='')}",
+            method,
+            timeout_seconds=timeout_seconds,
+        )
     except CollectorRequestRejected as error:
         raise HTTPException(status_code=error.status_code, detail=str(error)) from error
     except RuntimeError as error:

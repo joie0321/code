@@ -4,8 +4,28 @@ from __future__ import annotations
 
 from datetime import datetime
 from ipaddress import ip_address
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+
+class WaveGroupingPort(BaseModel):
+    """One explicitly approved application port in the dynamic/private range."""
+
+    protocol: Literal["tcp", "udp"]
+    port: int = Field(ge=32768, le=65535)
+
+
+class WaveGroupingPortAllowlistUpdate(BaseModel):
+    ports: list[WaveGroupingPort] = Field(default_factory=list, max_length=128)
+
+    @field_validator("ports")
+    @classmethod
+    def require_unique_ports(cls, ports: list[WaveGroupingPort]) -> list[WaveGroupingPort]:
+        values = [(entry.protocol, entry.port) for entry in ports]
+        if len(values) != len(set(values)):
+            raise ValueError("each protocol and port combination can be approved only once")
+        return ports
 
 
 class EnrollmentCreate(BaseModel):

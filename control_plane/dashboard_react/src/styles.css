@@ -55,3 +55,33 @@
   opacity: 1;
   transform: translate(-50%, 0);
 }
+
+.report-context dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px 28px;
+  margin: 0;
+}
+
+.report-context dl div {
+  min-width: 0;
+}
+
+.report-context dt {
+  margin-bottom: 5px;
+  color: #9eb2ca;
+  font-size: .74rem;
+  font-weight: 750;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.report-context dd {
+  margin: 0;
+  color: #f1f5fb;
+  overflow-wrap: anywhere;
+}
+
+@media(max-width:650px) {
+  .report-context dl { grid-template-columns: 1fr; }
+}

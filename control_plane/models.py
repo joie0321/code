@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from control_plane.db import Base
@@ -56,6 +56,9 @@ class Collector(Base):
         DateTime(timezone=True), nullable=True
     )
     last_successful_traffic_batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    wave_grouping_port_allowlist: Mapped[list[dict[str, object]]] = mapped_column(
+        JSON, default=list
+    )
 
 
 class ObservationBatch(Base):
@@ -141,6 +144,23 @@ class InventoryVmState(Base):
     power_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, index=True)
     captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class RecommendedWaveSnapshot(Base):
+    """Automatic-wave membership captured before a new inventory supersedes it."""
+
+    __tablename__ = "recommended_wave_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "collector_id", "inventory_batch_id", name="uq_wave_snapshot_inventory_batch"
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    collector_id: Mapped[str] = mapped_column(ForeignKey("collectors.id"), index=True)
+    inventory_batch_id: Mapped[str] = mapped_column(ForeignKey("inventory_batches.id"), index=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    waves: Mapped[list[dict[str, object]]] = mapped_column(JSON)
 
 
 class DependencyDecision(Base):

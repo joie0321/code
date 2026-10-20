@@ -120,11 +120,39 @@ def create_app(
         except (ControlPlaneClientError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
+    @app.post("/api/v1/aws/flow-logs/stop")
+    def stop_aws_flow_logs(collector_id: str) -> dict[str, str]:
+        try:
+            return active_runtime.stop_aws_flow_logs(collector_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/v1/aws/flow-logs/start")
+    def start_aws_flow_logs(collector_id: str) -> dict[str, str]:
+        try:
+            return active_runtime.start_aws_flow_logs(collector_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
     @app.post("/api/v1/azure/flow-logs/sync")
     def sync_azure_flow_logs(collector_id: str) -> dict[str, int]:
         try:
             return active_runtime.sync_azure_flow_logs(collector_id)
         except (ControlPlaneClientError, ValueError) as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/v1/azure/flow-logs/stop")
+    def stop_azure_flow_logs(collector_id: str) -> dict[str, str]:
+        try:
+            return active_runtime.stop_azure_flow_logs(collector_id)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+
+    @app.post("/api/v1/azure/flow-logs/start")
+    def start_azure_flow_logs(collector_id: str) -> dict[str, str]:
+        try:
+            return active_runtime.start_azure_flow_logs(collector_id)
+        except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
 
     @app.post("/api/v1/telemetry/observations")

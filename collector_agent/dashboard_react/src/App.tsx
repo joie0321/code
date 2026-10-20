@@ -49,6 +49,12 @@ function configured(value: boolean | undefined): string {
   return value ? "Configured" : "Not configured";
 }
 
+function flowLogPollTimestamp(source: CollectorSource): string {
+  if (source.source_type === "aws") return formatTimestamp(source.aws_flow_log_last_sync_at);
+  if (source.source_type === "azure") return formatTimestamp(source.azure_flow_log_last_sync_at);
+  return "Not applicable";
+}
+
 function sourceHealth(source: CollectorSource): { label: string; tone: string } {
   if (source.last_error) return { label: "Attention required", tone: "danger" };
   const ipfixStatus = source.ipfix_status?.trim().toLowerCase();
@@ -90,7 +96,8 @@ function SourceTable({ sources }: { sources: CollectorSource[] }) {
             <th>Status</th>
             <th>Inventory</th>
             <th>Last inventory sync</th>
-            <th>Last traffic sync</th>
+            <th>Last traffic upload</th>
+            <th>Last Flow Log poll</th>
             <th>Last heartbeat</th>
             <th>IPFIX</th>
             <th>Cloud Flow Logs</th>
@@ -113,6 +120,7 @@ function SourceTable({ sources }: { sources: CollectorSource[] }) {
                 <td>{displayValue(source.last_inventory_vm_count)} VM(s)</td>
                 <td>{formatTimestamp(source.last_inventory_sync_at)}</td>
                 <td>{formatTimestamp(source.last_traffic_sync_at)}</td>
+                <td>{flowLogPollTimestamp(source)}</td>
                 <td>{formatTimestamp(source.last_heartbeat_at)}</td>
                 <td>{source.source_type === "vmware" ? `${displayValue(source.ipfix_status)} · ${displayValue(source.ipfix_exporter_count)} exporter(s)` : "Not applicable"}</td>
                 <td>{source.source_type === "vmware" ? "Not applicable" : `${configured(source.source_type === "aws" ? source.aws_flow_logs_configured : source.azure_flow_logs_configured)}${flowLogState ? ` · ${flowLogState}` : ""}`}</td>

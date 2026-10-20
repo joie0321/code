@@ -150,7 +150,8 @@ def create_react_dashboard_app() -> FastAPI:
         collector_id: str, vm_uuid: list[str] = Query(default=[]),  # noqa: B008
         observed_after: str | None = None,
         observed_before: str | None = None, page: int = Query(default=1, ge=1, le=100000),
-        traffic_batch_id: str | None = None,
+        exclude_dynamic_private_ports: bool = False,
+        traffic_batch_id: str | None = None, traffic_received_after: str | None = None,
     ) -> dict[str, Any]:
         if len(vm_uuid) > 500:
             raise HTTPException(status_code=400, detail="Too many VM IDs")
@@ -158,7 +159,41 @@ def create_react_dashboard_app() -> FastAPI:
         try:
             return _client().wave_connections(
                 validated_collector_id, vm_uuid, observed_after, observed_before, page,
-                deduplicate=True, exclude_dynamic_private_ports=True, traffic_batch_id=traffic_batch_id,
+                deduplicate=True, exclude_dynamic_private_ports=exclude_dynamic_private_ports,
+                traffic_batch_id=traffic_batch_id, traffic_received_after=traffic_received_after,
+            )
+        except DashboardClientError as error:
+            raise _api_error(error) from error
+
+    @app.get("/api/v1/collectors/{collector_id}/wave-grouping-port-allowlist")
+    def wave_grouping_port_allowlist(collector_id: str) -> dict[str, Any]:
+        try:
+            return _client().wave_grouping_port_allowlist(_collector_id(collector_id))
+        except DashboardClientError as error:
+            raise _api_error(error) from error
+
+    @app.put("/api/v1/collectors/{collector_id}/wave-grouping-port-allowlist")
+    async def update_wave_grouping_port_allowlist(
+        collector_id: str, request: FastAPIRequest
+    ) -> dict[str, Any]:
+        payload = await _body(request)
+        ports = payload.get("ports")
+        if not isinstance(ports, list) or len(ports) > 128:
+            raise HTTPException(status_code=400, detail="ports must be a list of at most 128 entries")
+        for entry in ports:
+            if (
+                not isinstance(entry, dict)
+                or entry.get("protocol") not in {"tcp", "udp"}
+                or not isinstance(entry.get("port"), int)
+                or not 32768 <= entry["port"] <= 65535
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="each port must use tcp or udp and be between 32768 and 65535",
+                )
+        try:
+            return _client().update_wave_grouping_port_allowlist(
+                _collector_id(collector_id), ports
             )
         except DashboardClientError as error:
             raise _api_error(error) from error
